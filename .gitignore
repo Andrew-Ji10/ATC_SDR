@@ -1,0 +1,9 @@
+*.wav
+__pycache__/
+atc_receiver.py
+*.mp3
+clips/
+*.cs16
+*.cu8
+.DS_Store
+recordings/
