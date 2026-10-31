@@ -12,6 +12,9 @@ Tools for listening to, recording and decoding Bay Area air traffic with an ADAL
 |---|---|
 | [radio/south_bay.py](radio/south_bay.py), [sfo.py](radio/sfo.py), [oak.py](radio/oak.py) | Records every tower / ground / approach transmission in one area and summarizes the session |
 | [radio/bay_all.py](radio/bay_all.py) | Surveys all 43 Bay Area channels to see what you can pick up |
+| [radio/record.py](radio/record.py), [pi/record.sh](pi/record.sh) | Records any channel set for a set time, unattended (e.g. on a Raspberry Pi) |
+| [radio/linkwatch.py](radio/linkwatch.py), [pi/linktest.sh](pi/linktest.sh) | Watches the Pi-Pluto link for hours and logs every drop, stall and reconnect |
+| [radio/characterize.py](radio/characterize.py), [pi/characterize.sh](pi/characterize.sh) | Measures CPU, link and RF (gain sweep, interference), and recommends `--max-rate` / `--gain` |
 | [radio/multi_atc.py](radio/multi_atc.py) | Plays any set of channels live, in stereo |
 | [radio/listen.py](radio/listen.py), [gui.py](radio/gui.py), [atc_receiver.grc](radio/atc_receiver.grc) | One channel at a time (FM or AM), on the command line, in a GUI, or in GNU Radio Companion |
 | [radio/capture_clips.py](radio/capture_clips.py) | Saves transmissions on one channel as clips |
@@ -33,6 +36,7 @@ atcsdr/            shared library used by every script
   gr_receiver.py     GNU Radio single-channel receiver (used by listen.py, gui.py, capture_clips.py)
 radio/             airband scripts (listed above)
 adsb/              ADS-B scripts (listed above)
+pi/                Raspberry Pi: setup.sh (install, checks), characterize.sh, linktest.sh, record.sh
 samples/adsb/      a recorded ADS-B session: tracks, maps, animations
 tests/             pytest suite on synthetic signals (no hardware needed)
 recordings/        where recordings go (not tracked by git)
@@ -63,6 +67,102 @@ python -m pytest                    # optional: checks the DSP on synthetic sign
 it refers to a Linux-only backend. GNU Radio may print a few `vmcircbuf` warnings on its
 first run. For RTL-SDR, HackRF or Airspy with the GNU Radio tools, also run
 `conda install -c conda-forge gnuradio-osmosdr rtl-sdr`.
+
+### Install (Raspberry Pi)
+
+On Raspberry Pi OS (64-bit; a Pi 4 or 5), copy or clone this repository. The Pi talks
+to the Pluto over **Ethernet**. First give the Pluto a fixed address: plug it into any
+computer over USB, set `ipaddr_eth` and `netmask_eth` under `[NETWORK]` in `config.txt`
+on its drive (e.g. `192.168.3.2` / `255.255.255.0`), eject it, and wait for it to reboot.
+Then cable it to the Pi, or to the same switch, and run the setup once:
+
+```sh
+bash pi/setup.sh --pluto 192.168.3.2 --eth-ip 192.168.3.1/24  # cabled straight to the Pi
+bash pi/setup.sh --pluto 192.168.3.2                          # on the same LAN / switch
+bash pi/setup.sh --check                                      # just the checks, any time
+```
+
+It installs everything the airband recorder needs (not GNU Radio, so the single-channel
+GUI tools stay on the Mac) and saves the Pluto's address in `pi/pluto.conf` for the
+other scripts. `--eth-ip` gives the Pi's Ethernet port a static address on the Pluto's
+subnet, with no gateway, so the internet stays on Wi-Fi. Don't use it while you're
+SSHed in over that port; the script refuses. Setup ends by pinging the Pluto, opening it
+through libiio and checking that it tunes 120 MHz. If that last check fails, unlock the
+tuning range as below. With no `--pluto`, it uses a Pluto on USB.
+
+#### Characterize
+
+```sh
+pi/characterize.sh              # about two minutes; --area sfo, --cpu-only, --gains 30 40 50 ...
+```
+
+This measures this setup and saves the best `--max-rate` and `--gain` in `pi/pluto.conf`
+as `record.sh`'s defaults:
+
+- **System:** the board, CPU temperature, under-voltage or throttling (a throttled Pi
+  falls behind), free disk space, and the speed of the network link to the Pluto
+  (it needs gigabit).
+- **CPU:** how fast the Pi runs the receiver's DSP on synthetic IQ at each useful sample
+  rate. That's the lowest rate for each number of capture windows: for the whole Bay,
+  10.8 MSPS gives 2 windows, 5.76 gives 3, 4.32 gives 4. It picks the fewest windows
+  that run at 1.5× real time or better.
+- **Link:** the fraction of the samples the Pluto actually delivers at those rates.
+- **RF:** a gain sweep across every capture window, with the ADC level, clipping and
+  each channel's noise floor. The floor stays flat while the receiver's own noise
+  dominates, then rises dB for dB once the antenna's noise does. Past that knee, more
+  gain adds no sensitivity, so it recommends 6 dB past the knee, if the ADC has headroom
+  there. Channels whose floor sits far above the rest are flagged as steady signals or
+  local interference (the Pi, USB 3, power supplies).
+
+The report and the per-channel floors are saved in `recordings/characterize_<time>/`
+(`report.txt`, `rf.csv`). Run it with the antenna where it will stay. `radio/characterize.py`
+is the same script without the wrapper (`--device ip:...`).
+
+#### Link test
+
+```sh
+pi/linktest.sh 8h               # overnight; 0 = until Ctrl-C; --rate 10.8, --rate 0 (no stream)
+```
+
+This shows whether, and how often, the Pi loses the Pluto. Every second it pings the
+Pluto, checks the Ethernet port's link, and reads samples at the rate the recorder will
+use. It prints and logs each event with its time: an outage (3 or more lost pings in a
+row), the cable link dropping, a stream error and how long the reconnect took, a stall
+(a read taking more than about half a second), or a second short of samples. The summary
+gives the counts, the total and longest outage, and the round-trip times.
+`recordings/linktest_<time>/` holds `events.csv`, `summary.txt` and `link.csv` (one
+row per second: ping, link and the % of samples received), for plotting. The recorder
+reconnects by itself after a drop; this test tells you how often that would happen.
+
+#### Record
+
+`pi/record.sh DURATION [options]`:
+
+```sh
+pi/record.sh 2m                            # a quick test
+pi/record.sh 2h --area sfo                 # 2 hours of the SFO channels
+pi/record.sh 1h30m --area south_bay --gain 50
+pi/record.sh 0                             # until Ctrl-C or kill
+```
+
+- Durations look like `90` (minutes), `90s`, `45m`, `2h`, `1h30m` or `1d`.
+- `--area` is `bay` (the default, all 43 channels), `sfo`, `oak`, `south_bay` or a
+  `multi_atc.py` preset; `--channels "120.5 Tower, 121.5 Guard"` takes a custom list.
+  Every other option of the area scripts works too (`--gain`, `--threshold`, `--raw`, ...),
+  and options given here override the ones saved by `characterize.sh`.
+- Output goes to `recordings/<area>_<date>-<time>/`, the same as the area scripts. Run
+  from cron or systemd, the console output goes to `recordings/logs/`.
+- At the end the recorder warns `received only NN% of the samples` if the Pi couldn't keep
+  up. If so, use a lower `--max-rate` or record fewer channels.
+
+To record on a schedule, add a line with `crontab -e`, for example every day 07:00-09:00:
+
+```
+0 7 * * * /home/pi/ATC_SDR/pi/record.sh 2h --area sfo
+```
+
+`radio/record.py` is the same recorder without the wrapper, and runs anywhere:
+`python3 radio/record.py --device ip:192.168.3.2 --area oak --duration 45m`.
 
 ### Pluto: unlock the tuning range
 
@@ -126,7 +226,7 @@ python3 radio/bay_all.py            # all 43 channels above, plus guard 121.5
 
 python3 radio/sfo.py --list         # show the channels and how they'll be captured
 python3 radio/sfo.py --minutes 30 --listen        # longer, and play the audio
-python3 radio/bay_all.py --device ip:192.168.1.10 # over Ethernet: everything at once
+python3 radio/bay_all.py --device ip:192.168.3.2 # over Ethernet: everything at once
 ```
 
 Each run writes to `recordings/<area>_<date>-<time>/`:

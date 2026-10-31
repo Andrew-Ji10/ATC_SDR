@@ -64,7 +64,7 @@ class Pluto:
         self.uri, self.center, self.rate, self.gain = uri, center, int(rate), gain
         self.bandwidth = int(bandwidth or rate)
         self.buffer_size, self.kernel_buffers = buffer_size, kernel_buffers
-        self.ctx = self.buf = self._lo = None
+        self.ctx = self.buf = self._lo = self._rx_phy = None
         self._open()
 
     def _open(self):
@@ -76,16 +76,23 @@ class Pluto:
         ch = phy.find_channel("voltage0", False)
         ch.attrs["sampling_frequency"].value = str(self.rate)
         ch.attrs["rf_bandwidth"].value = str(self.bandwidth)
-        if self.gain in GAIN_MODES:
-            ch.attrs["gain_control_mode"].value = GAIN_MODES[self.gain]
-        else:
-            ch.attrs["gain_control_mode"].value = "manual"
-            ch.attrs["hardwaregain"].value = str(float(self.gain))
+        self._rx_phy = ch
+        self.set_gain(self.gain)
         for name in ("voltage0", "voltage1"):
             rx.find_channel(name, False).enabled = True
         rx.set_kernel_buffers_count(self.kernel_buffers)
         self.buf = iio.Buffer(rx, self.buffer_size, False)
         self.tune(self.center)
+
+    def set_gain(self, gain):
+        """A gain in dB, or one of GAIN_MODES."""
+        ch = self._rx_phy
+        if gain in GAIN_MODES:
+            ch.attrs["gain_control_mode"].value = GAIN_MODES[gain]
+        else:
+            ch.attrs["gain_control_mode"].value = "manual"
+            ch.attrs["hardwaregain"].value = str(float(gain))
+        self.gain = gain
 
     def tune(self, center):
         self._lo.attrs["frequency"].value = str(int(center))
@@ -102,7 +109,7 @@ class Pluto:
         return np.frombuffer(self.buf.read(), dtype=np.int16).copy()
 
     def close(self):
-        self.buf = self.ctx = self._lo = None
+        self.buf = self.ctx = self._lo = self._rx_phy = None
         gc.collect()
 
     def reconnect(self, stop):

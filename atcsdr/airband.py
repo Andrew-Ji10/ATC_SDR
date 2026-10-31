@@ -20,6 +20,7 @@ import argparse
 import math
 import os
 import queue
+import re
 import shutil
 import signal
 import sys
@@ -53,6 +54,8 @@ DC_GUARD = 10e3              # keep channels this far from the LO, where the DC 
 PASS_HZ = 5_000              # channel filter: flat to +-5 kHz ...
 STOP_HZ = 7_000              # ... and zero from +-7 kHz (channels are 25 kHz apart)
 ATIS_GAIN = 0.3              # ATIS loops play quietly and without squelch
+TTY = sys.stdout.isatty()    # live status line only on a terminal, not in a log file
+CLEAR = "\r\033[K" if TTY else ""
 
 # Squelch, per channel.
 CALIBRATE_S = 2.0            # learn the noise floor this long before opening
@@ -308,8 +311,10 @@ def find_uri(device):
     return device if is_rtl(device) else pluto.find_uri(device)
 
 
-def max_rate(uri):
-    return RTL_MAX_RATE if is_rtl(uri) else pluto.max_rate(uri)
+def max_rate(uri, cap_msps=None):
+    """The link's highest sample rate, or `cap_msps` (--max-rate) if lower."""
+    limit = RTL_MAX_RATE if is_rtl(uri) else pluto.max_rate(uri)
+    return min(limit, int(cap_msps * 1e6)) if cap_msps else limit
 
 
 def link_name(uri):
@@ -332,7 +337,7 @@ def monitor(freqs, opts):
     strength, no_mp3, log (CSV path), summary (text path). Returns the Channels."""
     signal.signal(signal.SIGTERM, _terminate)
     uri = find_uri(opts.device)
-    rate, windows = plan(fq.dedupe(freqs), max_rate(uri))
+    rate, windows = plan(fq.dedupe(freqs), max_rate(uri, getattr(opts, "max_rate", None)))
     print(describe_plan(rate, windows, opts.dwell, uri))
 
     channels = {}
@@ -400,13 +405,13 @@ def monitor(freqs, opts):
                         stats["lost"] += len(raw) // 2
                     continue
                 # Reconnect outside the except block (see Pluto).
-                print(f"\r\033[KConnection error ({error}); reconnecting...")
+                print(f"{CLEAR}Connection error ({error}); reconnecting...")
                 gone = radio.reconnect(stop)
                 if gone is None:
                     break
                 stats["reconnects"] += 1
                 stats["dead_s"] += gone
-                print(f"\r\033[KReconnected after {gone:.1f} s.")
+                print(f"{CLEAR}Reconnected after {gone:.1f} s.")
                 switch_at = time.time() + opts.dwell
                 raw_q.put(("gap", time.time()))
         finally:
@@ -488,7 +493,7 @@ def monitor(freqs, opts):
         if log:
             log.write(f"{when:%Y-%m-%d %H:%M:%S},{ch.mhz:.3f},{ch.name},{ch.kind},"
                       f"{tx.seconds:.1f},{tx.peak_db:.1f},{clip}\n")
-        print("\r\033[K" + line)
+        print(CLEAR + line)
 
     try:
         while not stop.is_set():
@@ -498,8 +503,9 @@ def monitor(freqs, opts):
                 handle(events.get(timeout=0.25))
             except queue.Empty:
                 pass
-            print("\r\033[K" + _status(windows, win_channels, state, time.time() - t0,
-                                       opts.duration), end="", flush=True)
+            if TTY:
+                print(CLEAR + _status(windows, win_channels, state, time.time() - t0,
+                                      opts.duration), end="", flush=True)
     except KeyboardInterrupt:
         pass
     finally:
@@ -599,6 +605,20 @@ def summary(channels, elapsed, started):
 
 # ------------------------------------------------------------------ CLIs
 
+DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_duration(text):
+    """'90' (minutes), '90s', '45m', '2h', '1h30m', '1d' -> seconds (an argparse type)."""
+    text = text.strip().lower()
+    if re.fullmatch(r"\d+(\.\d+)?", text):
+        return float(text) * 60
+    parts = re.findall(r"(\d+(?:\.\d+)?)([smhd])", text)
+    if not parts or "".join(n + u for n, u in parts) != text:
+        raise argparse.ArgumentTypeError(f"can't read {text!r}: use e.g. 90, 45m, 2h, 1h30m")
+    return sum(float(n) * DURATION_UNITS[u] for n, u in parts)
+
+
 def add_receiver_args(p, listen_default):
     p.add_argument("--device", default="",
                    help="Pluto libiio URI (e.g. ip:pluto.local), or rtl / rtl:N for an RTL-SDR "
@@ -608,6 +628,9 @@ def add_receiver_args(p, listen_default):
                    help="dB above a channel's noise floor that opens its squelch (default 8)")
     p.add_argument("--dwell", type=float, default=30.0,
                    help="seconds per capture window when the channels need several (default 30)")
+    p.add_argument("--max-rate", type=float, metavar="MSPS",
+                   help="cap the sample rate, for a slower computer such as a Raspberry Pi: "
+                        "less CPU, but narrower capture windows (default: the link's maximum)")
     p.add_argument("--atis", action="store_true", help="include ATIS, mixed in quietly, no squelch")
     if listen_default:
         p.add_argument("--no-audio", dest="listen", action="store_false",
@@ -648,7 +671,7 @@ def area_main(area, default_minutes=10):
         print(a["title"])
         if uri == FALLBACK_URI and not args.device:
             print("(No Pluto found; planning for a USB connection.)")
-        rate, windows = plan(freqs, max_rate(uri))
+        rate, windows = plan(freqs, max_rate(uri, args.max_rate))
         print(describe_plan(rate, windows, args.dwell, uri))
         return
     out = args.out or os.path.join("recordings", f"{area}_{datetime.now():%Y%m%d-%H%M}")

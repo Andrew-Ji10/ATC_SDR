@@ -8,3 +8,5 @@ clips/
 .DS_Store
 recordings/
 .pytest_cache/
+.venv/
+pi/pluto.conf
