@@ -17,7 +17,7 @@
 #   2. with --eth-ip: a static address on the Pi's Ethernet port (NetworkManager),
 #      for a direct cable; internet keeps going over Wi-Fi
 #   3. a udev rule so a Pluto on USB works without sudo (for configuring it)
-#   4. a virtualenv in .venv (with the system numpy/scipy) holding noisereduce
+#   4. a virtualenv in .venv (with the system numpy/scipy) holding noisereduce and numba
 #   5. checks: Python modules, lame, the Pluto reachable, and that it tunes airband
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
@@ -114,8 +114,9 @@ EOF
     [ -x "$PY" ] || python3 -m venv --system-site-packages "$VENV"
     "$PY" -m pip install -q --upgrade pip
     # shellcheck disable=SC2086
-    "$PY" -m pip install -q noisereduce $PIP_IIO
-    ok "noisereduce${PIP_IIO:+, $PIP_IIO} installed"
+    # numba: compiled, multi-core DSP (radio/dsp_bench.py).
+    "$PY" -m pip install -q noisereduce numba $PIP_IIO
+    ok "noisereduce, numba${PIP_IIO:+, $PIP_IIO} installed"
 
     mkdir -p "$ROOT/recordings/logs"
     chmod +x "$ROOT/pi/"*.sh "$ROOT/radio/"*.py 2>/dev/null || true
@@ -129,7 +130,7 @@ fi
 say "Checks"
 if [ -x "$PY" ]; then ok "virtualenv: $("$PY" --version)"; else bad "no $VENV: run bash pi/setup.sh"; PY=python3; fi
 
-for mod in numpy scipy iio noisereduce; do
+for mod in numpy scipy iio noisereduce numba; do
     if "$PY" -c "import $mod" 2>/dev/null; then ok "python module $mod"; else bad "python module $mod missing"; fi
 done
 if command -v lame >/dev/null; then ok "lame (MP3 clips)"; else warn "lame missing: clips will be WAV only"; fi

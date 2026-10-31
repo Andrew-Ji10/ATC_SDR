@@ -14,6 +14,7 @@ Tools for listening to, recording and decoding Bay Area air traffic with an ADAL
 | [radio/bay_all.py](radio/bay_all.py) | Surveys all 43 Bay Area channels to see what you can pick up |
 | [radio/record.py](radio/record.py), [pi/record.sh](pi/record.sh) | Records any channel set for a set time, unattended (e.g. on a Raspberry Pi) |
 | [radio/linkwatch.py](radio/linkwatch.py), [pi/linktest.sh](pi/linktest.sh) | Watches the Pi-Pluto link for hours and logs every drop, stall and reconnect |
+| [radio/dsp_bench.py](radio/dsp_bench.py), [pi/dspbench.sh](pi/dspbench.sh) | Benchmarks the DSP for the whole band in one window (21.6 MSPS), single- and multi-core |
 | [radio/characterize.py](radio/characterize.py), [pi/characterize.sh](pi/characterize.sh) | Measures CPU, link and RF (gain sweep, interference), and recommends `--max-rate` / `--gain` |
 | [radio/multi_atc.py](radio/multi_atc.py) | Plays any set of channels live, in stereo |
 | [radio/listen.py](radio/listen.py), [gui.py](radio/gui.py), [atc_receiver.grc](radio/atc_receiver.grc) | One channel at a time (FM or AM), on the command line, in a GUI, or in GNU Radio Companion |
@@ -36,7 +37,7 @@ atcsdr/            shared library used by every script
   gr_receiver.py     GNU Radio single-channel receiver (used by listen.py, gui.py, capture_clips.py)
 radio/             airband scripts (listed above)
 adsb/              ADS-B scripts (listed above)
-pi/                Raspberry Pi: setup.sh (install, checks), characterize.sh, linktest.sh, record.sh
+pi/                Raspberry Pi: setup.sh (install, checks), characterize.sh, linktest.sh, dspbench.sh, record.sh
 samples/adsb/      a recorded ADS-B session: tracks, maps, animations
 tests/             pytest suite on synthetic signals (no hardware needed)
 recordings/        where recordings go (not tracked by git)
@@ -133,6 +134,30 @@ gives the counts, the total and longest outage, and the round-trip times.
 `recordings/linktest_<time>/` holds `events.csv`, `summary.txt` and `link.csv` (one
 row per second: ping, link and the % of samples received), for plotting. The recorder
 reconnects by itself after a drop; this test tells you how often that would happen.
+
+#### DSP benchmark: the whole band in one window?
+
+```sh
+pi/dspbench.sh                  # about 3 minutes, no radio needed; --sustain 300, --quick
+```
+
+The 43 channels span 118.000-135.650 MHz, which fits one capture window at 21.6 MSPS: every
+channel is heard all the time. This tests whether the Pi can process that rate:
+
+1. **Today's receiver** at 10.8 MSPS (2 windows) and 21.6 MSPS (1 window).
+2. **A polyphase channelizer.** 21.6 MSPS / 25 kHz = 864 channels, exactly on the airband
+   grid, with a 12-tap filter per branch and small 864-point FFTs. It runs in numpy, and
+   compiled with numba on 1, 2 and 4 cores. It also checks that a tone comes out of its own
+   channel only (neighbours more than 50 dB down).
+3. **Demodulation** of the 43 channels: today's Python loop against compiled code.
+4. **The whole proposed pipeline** (raw IQ in, 43 demodulated channels out), with the share
+   of time each stage takes.
+5. **A sustained run** on the best core count, watching temperature and throttling: four
+   busy cores heat a Pi 5 quickly, so fit the active cooler.
+
+On a desktop, the compiled pipeline runs about 7x real time on one core and 10x on four;
+today's receiver manages about 2.2x at 21.6 MSPS. The radio link must also carry
+21.6 MSPS (86 MB/s): check with `pi/linktest.sh 2m --rate 21.6`.
 
 #### Record
 
