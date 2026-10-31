@@ -2,11 +2,11 @@
 """
 Animate a recorded ADS-B session: aircraft move across the map in time.
 
-    python3 animate_tracks.py tracks.csv --ref 37.43 -122.17          # -> tracks.mp4
-    python3 animate_tracks.py tracks.csv --speed 20 --out fast.mp4
-    python3 animate_tracks.py tracks.csv --out tracks.gif              # GIF instead
+    python3 adsb/animate_tracks.py samples/adsb/tracks.csv --ref 37.43 -122.17   # -> .mp4
+    python3 adsb/animate_tracks.py tracks.csv --speed 20 --out fast.mp4
+    python3 adsb/animate_tracks.py tracks.csv --out tracks.gif         # GIF instead
 
-Reads the CSV that adsb_plot.py writes with --csv. Each aircraft is drawn as an
+Reads the position CSV that adsb_plot.py --csv and adsb_decode.py --out write. Each aircraft is drawn as an
 arrow pointing along its track, colored by altitude, with:
   - a trail of where it has been (the last --trail seconds, fading out),
   - a dashed velocity vector: where it will be in --lead seconds at its current
@@ -24,8 +24,10 @@ GIF output needs only Pillow.
 import argparse
 import csv
 import math
+import sys
 import time
 from collections import defaultdict
+from pathlib import Path
 
 import matplotlib
 
@@ -34,20 +36,20 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FFMpegWriter, FuncAnimation, PillowWriter
 from matplotlib.collections import LineCollection
-from matplotlib.colors import LinearSegmentedColormap, Normalize
 from matplotlib.markers import MarkerStyle
-from matplotlib.path import Path
+from matplotlib.path import Path as MPath
 from matplotlib.transforms import Affine2D
 
-from adsb_plot import ALT_MAX_FT, ALT_RAMP, GAP_SECONDS
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))    # repo root, for atcsdr
+
+from atcsdr.adsb_map import GAP_SECONDS, GRID, INK, MUTED, SURFACE, altitude_colors  # noqa: E402
 
 HOLD_S = 10.0                # keep an aircraft on screen this long after its last fix
 NOTE_S = 1.5                 # how long (video seconds) the "skipped" note stays up
-INK, MUTED, GRID, SURFACE = "#1f1f1e", "#6b6a66", "#e6e5e1", "#fcfcfb"
 
 # An arrowhead pointing north (+y), rotated to each aircraft's track.
-ARROW = Path([(0, 1), (0.62, -0.8), (0, -0.35), (-0.62, -0.8), (0, 1)],
-             [Path.MOVETO, Path.LINETO, Path.LINETO, Path.LINETO, Path.CLOSEPOLY])
+ARROW = MPath([(0, 1), (0.62, -0.8), (0, -0.35), (-0.62, -0.8), (0, 1)],
+              [MPath.MOVETO, MPath.LINETO, MPath.LINETO, MPath.LINETO, MPath.CLOSEPOLY])
 
 
 def num(v):
@@ -136,7 +138,9 @@ def main():
     # Skip stretches with nobody in view, keeping a moment either side of each.
     grid = np.arange(t_start, t_end, args.speed / args.fps)
     seen = np.array([any(state_at(pl, t) is not None for pl in planes.values()) for t in grid])
-    keep = seen | np.convolve(seen, np.ones(2 * args.fps + 1), "same").astype(bool)
+    pad = args.fps              # frames
+    near = np.convolve(seen, np.ones(2 * pad + 1), "full")[pad: pad + len(seen)] > 0
+    keep = seen | near
     frame_times = grid[keep]
     jumps = np.diff(frame_times) > 1.5 * args.speed / args.fps
     skipped = {}                      # frame index -> seconds skipped just before it
@@ -144,8 +148,7 @@ def main():
         for j in range(k, min(k + int(NOTE_S * args.fps), len(frame_times))):
             skipped[j] = frame_times[k] - frame_times[k - 1]
 
-    cmap = LinearSegmentedColormap.from_list("alt", ALT_RAMP)
-    norm = Normalize(0, ALT_MAX_FT)
+    cmap, norm = altitude_colors()
 
     fig = plt.figure(figsize=(12, 7.5), facecolor=SURFACE)
     ax = fig.add_axes([0.06, 0.08, 0.62, 0.84], facecolor=SURFACE)

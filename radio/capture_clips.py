@@ -2,9 +2,9 @@
 """
 Capture individual transmissions from an AM (ATC) or NBFM channel as clips.
 
-    python3 capture_clips.py 120.1                  # wait for 1 transmission
-    python3 capture_clips.py 120.1 --clips 5 --max-time 900
-    python3 capture_clips.py 118.6 --listen         # also play audio while waiting
+    python3 radio/capture_clips.py 120.1                  # wait for 1 transmission
+    python3 radio/capture_clips.py 120.1 --clips 5 --max-time 900
+    python3 radio/capture_clips.py 118.6 --listen         # also play audio while waiting
 
 How it works:
     - The tuned channel's power is measured in 20 ms frames.
@@ -20,18 +20,19 @@ How it works:
 import argparse
 import os
 import queue
-import shutil
-import subprocess
 import sys
 import time
-import wave
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 from gnuradio import gr
 
-import sdr_receiver as sr
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))    # repo root, for atcsdr
+
+from atcsdr import gr_receiver as sr  # noqa: E402
+from atcsdr.audio import find_lame, save_clip  # noqa: E402
 
 FRAME_S = 0.02
 CALIBRATE_S = 2.0
@@ -107,29 +108,6 @@ class ClipDetector(gr.sync_block):
             self.active = None
             self.loud = 0
             self.pre_roll.clear()
-
-
-def save_clip(audio, path_base, rate, mp3, title):
-    pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
-    wav_path = path_base + ".wav"
-    with wave.open(wav_path, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(rate)
-        w.writeframes(pcm.tobytes())
-    paths = [wav_path]
-    if mp3:
-        mp3_path = path_base + ".mp3"
-        subprocess.run([mp3, "--quiet", "-b", "128", "--tt", title, wav_path, mp3_path],
-                       check=True)
-        paths.append(mp3_path)
-    return paths
-
-
-def find_lame():
-    # Prefer the encoder from this Python's environment (conda installs it there).
-    local = os.path.join(os.path.dirname(sys.executable), "lame")
-    return local if os.path.exists(local) else shutil.which("lame")
 
 
 def main():

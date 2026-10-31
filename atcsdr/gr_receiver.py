@@ -1,25 +1,10 @@
-#!/usr/bin/env python3
-"""
-GNU Radio receiver for broadcast FM and airband (ATC) AM.
+"""GNU Radio receiver for broadcast FM and airband (ATC) AM: one channel at a time.
 
-Supports ADALM-PLUTO (via gr-iio, the default) and RTL-SDR / HackRF / Airspy
-(via gr-osmosdr, --sdr osmosdr). A stock Pluto only tunes 325 MHz - 3.8 GHz;
-FM and airband need the AD9364 firmware setting (70 MHz - 6 GHz), see README.md.
-For a graphical interface with a spectrum display, run sdr_gui.py.
-
-Examples:
-    python3 sdr_receiver.py 88.5              # broadcast FM (mode auto-detected)
-    python3 sdr_receiver.py 118.6 --squelch -45   # ATC tower, AM with squelch
-    python3 sdr_receiver.py 162.55 --mode nbfm    # NOAA weather radio
-    python3 sdr_receiver.py 120.5 --record sfo_tower.wav
-
-While running, type commands at the prompt:
-    <MHz>        retune (e.g. 121.8)
-    v <0-5>      volume
-    g <dB>|auto  RF gain
-    sq <dB>      squelch threshold (AM / NBFM only), e.g. sq -45
-    s            print current channel power (use it to pick a squelch level)
-    q            quit
+Used by radio/listen.py (command line), radio/gui.py (Qt spectrum GUI) and
+radio/capture_clips.py. Supports ADALM-PLUTO (via gr-iio, the default) and
+RTL-SDR / HackRF / Airspy (via gr-osmosdr, --sdr osmosdr). A stock Pluto only
+tunes 325 MHz - 3.8 GHz; FM and airband need the AD9364 firmware setting
+(70 MHz - 6 GHz), see README.md.
 
 Signal chain:
     SDR parked on a band center ("LO"), sampling `span` Hz of spectrum
@@ -34,7 +19,6 @@ The LO is moved only when the target falls outside the band or too close to the
 LO itself, where DC offset / LO leakage (and the Pluto's DC tracking) live.
 """
 
-import argparse
 import math
 import sys
 
@@ -300,36 +284,6 @@ def make_wav_sink(path):
         return blocks.wavfile_sink(path, 1, AUDIO_RATE, 16)
 
 
-def control_loop(rx):
-    print("Commands: <MHz> | v <vol> | g <dB|auto|fast> | sq <dB> | s | q")
-    while True:
-        try:
-            line = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-        if not line:
-            continue
-        cmd, *rest = line.split()
-        arg = rest[0] if rest else None
-        try:
-            if cmd in ("q", "quit", "exit"):
-                return
-            elif cmd == "s":
-                print(f"channel power: {rx.power_db():.1f} dB")
-            elif cmd == "v" and arg:
-                rx.set_volume(float(arg))
-            elif cmd == "g" and arg:
-                rx.set_gain(arg)
-            elif cmd == "sq" and arg:
-                rx.set_squelch(float(arg))
-            else:
-                rx.set_freq(float(cmd) * 1e6)
-                print(f"tuned to {rx.freq / 1e6:.4f} MHz")
-        except ValueError as e:
-            print(f"error: {e}")
-
-
 def add_sdr_args(p):
     """Arguments shared by the CLI and the GUI."""
     p.add_argument("--mode", choices=["auto", *MODES], default="auto",
@@ -374,37 +328,3 @@ def warn_pluto_range(args, freq):
     if args.sdr == "pluto" and freq < PLUTO_STOCK_MIN:
         print(f"note: {freq / 1e6:g} MHz needs a Pluto with an AD9361/AD9364 (or the AD9364 "
               "firmware setting); a stock AD9363 stops at 325 MHz. See README.md.")
-
-
-def main():
-    p = argparse.ArgumentParser(
-        description="Listen to broadcast FM or airband ATC with an SDR.")
-    p.add_argument("freq", type=float, help="frequency in MHz, e.g. 88.5 or 118.6")
-    add_sdr_args(p)
-    args = p.parse_args()
-
-    freq = args.freq * 1e6
-    mode = auto_mode(freq) if args.mode == "auto" else args.mode
-    warn_pluto_range(args, freq)
-
-    try:
-        rx = open_receiver(args, freq, mode)
-    except RuntimeError as e:
-        sys.exit(str(e))
-
-    print(f"Listening on {args.freq:.4f} MHz [{mode.upper()}], gain {args.gain}")
-    rx.start()
-    try:
-        if sys.stdin.isatty():
-            control_loop(rx)
-        else:
-            rx.wait()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        rx.stop()
-        rx.wait()
-
-
-if __name__ == "__main__":
-    main()

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Qt GUI for sdr_receiver: live spectrum + waterfall of a band, click-to-tune,
+Qt GUI for the GNU Radio receiver (atcsdr/gr_receiver.py): live spectrum + waterfall of a band, click-to-tune,
 signal meter, audio on/off, volume / squelch / gain / mode controls.
 
-    python3 sdr_gui.py 118.6                 # airband around 118.6 MHz
-    python3 sdr_gui.py 98.5 --span 3.84      # FM broadcast, wider view
+    python3 radio/gui.py 118.6                 # airband around 118.6 MHz
+    python3 radio/gui.py 98.5 --span 3.84      # FM broadcast, wider view
 
 Tuning:
     - click anywhere on the spectrum or waterfall, or drag the yellow marker
@@ -17,12 +17,15 @@ import argparse
 import signal
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
 from PyQt5 import QtCore, QtWidgets
 
-import sdr_receiver as sr
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))    # repo root, for atcsdr
+
+from atcsdr import gr_receiver as sr  # noqa: E402
 
 # Frequency box step (MHz) and click-to-tune snap (Hz) per mode.
 MODE_STEP_MHZ = {"wfm": 0.1, "am": 0.025, "nbfm": 0.0125}

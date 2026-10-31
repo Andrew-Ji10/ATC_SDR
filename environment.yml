@@ -1,0 +1,23 @@
+# conda env create -f environment.yml && conda activate sdr
+name: sdr
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.11
+  - gnuradio            # radio/listen.py, gui.py, capture_clips.py, atc_receiver.grc
+  - gnuradio-iio
+  - libiio              # Pluto access for everything (Python bindings included)
+  - libad9361-iio
+  - pyqt
+  - pyqtgraph
+  - numpy
+  - scipy
+  - matplotlib
+  - lame                # MP3 copies of clips
+  - pip
+  - pip:
+      - pyModeS>=3      # ADS-B decoding
+      - sounddevice     # audio out for multi_atc.py and the area scripts
+      - noisereduce     # cleaned clips
+      - imageio-ffmpeg  # MP4 output for animate_tracks.py
+      - pytest

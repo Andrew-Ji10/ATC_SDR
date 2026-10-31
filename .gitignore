@@ -7,3 +7,4 @@ clips/
 *.cu8
 .DS_Store
 recordings/
+.pytest_cache/
