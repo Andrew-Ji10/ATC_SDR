@@ -105,7 +105,7 @@ def loopback(rep, seconds):
     rep(f"  pack + unpack round trip exact: {exact}; this computer unpacks "
         f"{20 * n / (time.perf_counter() - t) / 1e6:.0f} MSPS on one core "
         f"({'numba' if IQ.numba else 'numpy'}; 21.6 needed)")
-    r = IQ.PackedPluto("packed:127.0.0.1", 0, 21.6e6, test_rate=0, local=True, port=5310)
+    r = IQ.PackedPluto("packed:127.0.0.1", 0, 21.6e6, bits=12, conns=2, test_rate=0, local=True, port=5310)
     res = measure(r, seconds, verify=True)
     ok = res["error"] is None and res["checked"] > 0 and res["wrong"] == 0
     rep(f"  {res['sps'] / 1e6:.0f} MSPS ({res['sps'] * 3 / 1e6:.0f} MB/s packed); {res['checked']} chunks "
@@ -115,17 +115,22 @@ def loopback(rep, seconds):
 
 
 def radio_log(r, *keys):
-    """iqstream's log lines containing any of `keys` (after it has stopped)."""
-    time.sleep(0.5)                                  # iqstream notices the disconnect and logs its totals
-    try:
-        return [l.replace("iqstream: ", "") for l in r.shell.text("cat /tmp/iqstream.log").splitlines()
-                if any(k in l for k in keys)]
-    except Exception:
-        return []
+    """iqstream's log lines containing any of `keys`, once it has stopped (it
+    logs its totals and each thread's CPU last: wait up to 3 s for that)."""
+    lines = []
+    for _ in range(6):
+        time.sleep(0.5)
+        try:
+            lines = r.shell.text("cat /tmp/iqstream.log").splitlines()
+        except Exception:
+            return []
+        if any("done" in l for l in lines):
+            break
+    return [l.replace("iqstream: ", "") for l in lines if any(k in l for k in keys)]
 
 
 def radio_test(rep, host, password, seconds, snap):
-    rep.section("2. The radio sending its test pattern at 21.6 MSPS (packing + network, no capture)")
+    rep.section("2. The radio sending a test pattern at 21.6 MSPS, 16-bit (network only, no capture)")
     out = []
     for conns in (1, 2):
         try:
@@ -137,22 +142,22 @@ def radio_test(rep, host, password, seconds, snap):
         res.update(conns=conns)
         out.append(res)
         rep(f"  {conns} connection(s): {100 * res['sps'] / 21.6e6:4.0f}% of 21.6 MSPS = "
-            f"{res['sps'] * 3 / 1e6:3.0f} MB/s; {res['checked']} chunks checked, {res['wrong']} wrong; "
+            f"{res['sps'] * 4 / 1e6:3.0f} MB/s; {res['checked']} chunks checked, {res['wrong']} wrong; "
             f"radio {fmt_load(res['load'])}" + (f"; error: {res['error']}" if res["error"] else ""))
         for line in radio_log(r, "done")[-1:]:
             rep(f"         radio: {line}")
     return out
 
 
-# (MSPS, bits, connections, capture, copy first): what each run isolates.
+# (MSPS, bits, connections, capture, copy first): what each run isolates. On the
+# first run, 16-bit straight from the DMA block (1 connection) did 81 MB/s at
+# 21.6 MSPS, and packing to 12 bits cost the radio more than it saved.
 PLAN = [
-    (21_600_000, 12, 1, "mmap", False),   # zero-copy capture, packed straight from the DMA block
-    (21_600_000, 12, 1, "mmap", True),    # ... copied to cached memory first
-    (21_600_000, 12, 2, "mmap", False),   # ... two senders
-    (21_600_000, 16, 1, "mmap", False),   # 16-bit straight from the block: iiod's way, but pinned
-    (21_600_000, 12, 1, "read", False),   # the old read() capture, for comparison
-    (19_200_000, 12, 1, "mmap", False),
-    (19_200_000, 12, 2, "mmap", False),
+    (19_200_000, 16, 1, "mmap", False),   # the whole band, outer channels nearer the band edges
+    (19_200_000, 16, 2, "mmap", False),
+    (21_600_000, 16, 1, "mmap", False),   # the whole band, with the usual margins
+    (21_600_000, 16, 2, "mmap", False),   # a second sender on the other core
+    (21_600_000, 12, 2, "mmap", True),    # 12-bit for comparison: copy first, two packers
 ]
 
 
@@ -187,7 +192,7 @@ def verdict(rep, ok_loop, test_runs, real_runs):
         rep("-> The loopback check failed: fix that before trusting anything else.")
     best = {}
     for r in real_runs:
-        if r["bits"] == 12 and not r["error"]:
+        if not r["error"]:
             key = r["rate"]
             if key not in best or r["sps"] > best[key]["sps"]:
                 best[key] = r
@@ -195,21 +200,22 @@ def verdict(rep, ok_loop, test_runs, real_runs):
         r = best.get(rate)
         if r:
             full = r["sps"] >= 0.99 * rate and r["lost"] == 0
-            rep(f"{rate / 1e6:g} MSPS, 12-bit: best {100 * r['sps'] / rate:.0f}% ({r['capture']}, "
-                f"{r['conns']} connection(s))" + ("  -> the whole band gets through" if full else ""))
-    sixteen = [r for r in real_runs if r["bits"] == 16 and not r["error"]]
-    if sixteen:
-        r = sixteen[0]
-        rep(f"16-bit straight from the DMA block, pinned (iiod's way): {r['sps'] * 4 / 1e6:.0f} MB/s "
-            f"({r['sps'] / 1e6:.1f} MSPS); iiod managed 62-74 MB/s")
+            rep(f"{rate / 1e6:g} MSPS: best {100 * r['sps'] / rate:.0f}% ({r['bits']}-bit, {r['conns']} "
+                f"connection(s), {r['sps'] * (3 if r['bits'] == 12 else 4) / 1e6:.0f} MB/s)"
+                + ("  -> the whole band gets through" if full else ""))
     if test_runs:
         top = max(test_runs, key=lambda r: r["sps"])
-        rep(f"test pattern (packing + sending, no capture): {100 * top['sps'] / 21.6e6:.0f}% of 21.6 MSPS "
+        rep(f"test pattern (network only, no capture): {100 * top['sps'] / 21.6e6:.0f}% of 21.6 MSPS "
             f"with {top['conns']} connection(s)")
-    if any(r["sps"] >= 0.99 * FULL_BAND[1] and r["lost"] == 0 for r in best.values()):
-        rep("-> Use --device packed:<address> with 21.6 MSPS: one window, all 43 channels.")
-    elif any(r["sps"] >= 0.99 * FULL_BAND[0] and r["lost"] == 0 for r in best.values()):
-        rep("-> 19.2 MSPS works: the whole band if the outer channels may sit nearer the band edges.")
+    win = lambda rate: (r := best.get(rate)) and r["sps"] >= 0.99 * rate and r["lost"] == 0
+    if win(FULL_BAND[1]):
+        r = best[FULL_BAND[1]]
+        rep(f"-> Use --device packed:<address> at 21.6 MSPS ({r['bits']}-bit, {r['conns']} connection(s)): "
+            "one window, all 43 channels.")
+    elif win(FULL_BAND[0]):
+        r = best[FULL_BAND[0]]
+        rep(f"-> 19.2 MSPS works ({r['bits']}-bit, {r['conns']} connection(s)): the whole band, if the outer "
+            "channels may sit nearer the band edges (characterize.sh shows their noise floor).")
 
 
 def main():

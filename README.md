@@ -14,7 +14,7 @@ Tools for listening to, recording and decoding Bay Area air traffic with an ADAL
 | [radio/bay_all.py](radio/bay_all.py) | Surveys all 43 Bay Area channels to see what you can pick up |
 | [radio/record.py](radio/record.py), [pi/record.sh](pi/record.sh) | Records any channel set for a set time, unattended (e.g. on a Raspberry Pi) |
 | [radio/linkwatch.py](radio/linkwatch.py), [pi/linktest.sh](pi/linktest.sh) | Watches the Pi-Pluto link for hours and logs every drop, stall and reconnect |
-| [radio/iqstream/iqstream.c](radio/iqstream/iqstream.c), [pi/iqstream_test.sh](pi/iqstream_test.sh) | The 12-bit streamer for the radio (`--device packed:...`), and its check |
+| [radio/iqstream/iqstream.c](radio/iqstream/iqstream.c), [pi/iqstream_test.sh](pi/iqstream_test.sh) | The streamer for the radio, faster than `iiod` (`--device packed:...`), and its check |
 | [radio/link_diag.py](radio/link_diag.py), [pi/linkdiag.sh](pi/linkdiag.sh) | Finds why the Pluto can't stream 21.6 MSPS: radio capture, network stack or iiod |
 | [radio/dsp_bench.py](radio/dsp_bench.py), [pi/dspbench.sh](pi/dspbench.sh) | Benchmarks the DSP for the whole band in one window (21.6 MSPS), single- and multi-core |
 | [radio/characterize.py](radio/characterize.py), [pi/characterize.sh](pi/characterize.sh) | Measures CPU, link and RF (gain sweep, interference), and recommends `--max-rate` / `--gain` |
@@ -168,14 +168,17 @@ The verdict says which part is the limit and what would fix it: buffer settings,
 newer `iiod`, a custom streaming program on the radio (12-bit samples need 65 MB/s), or
 processing on the radio's FPGA.
 
-#### iqstream: the 12-bit streamer
+#### iqstream: a faster streamer than iiod
 
-The radio's samples are 12 bits, but `iiod` sends them in 16-bit slots, and one of the
-radio's ARM cores can't push 21.6 MSPS (86 MB/s) through TCP. `iqstream`
-([radio/iqstream/iqstream.c](radio/iqstream/iqstream.c)) packs them to 12 bits (65 MB/s)
-and sends them from threads pinned to the radio's two cores. It runs from the radio's
-RAM (`/tmp`), so nothing is written to its flash and a reboot removes it. Tuning, gain and
-sample rate still go through `iiod`.
+`iiod`, the radio's own streaming program, runs on whichever of the radio's two cores the
+scheduler picks. Sometimes that's the core handling the Ethernet interrupts, and then it
+tops out near 62 MB/s (15.5 MSPS). `iqstream` ([radio/iqstream/iqstream.c](radio/iqstream/iqstream.c))
+maps the radio's DMA blocks and sends them straight from the block, from a thread pinned
+to the other core. That measured **81 MB/s (20.3 MSPS)** at 21.6 MSPS, enough for the
+whole band at 19.2 MSPS. It can also pack the 12-bit samples into 3 bytes (`-f 12`), but
+on the radio's ARM, packing costs more than it saves, so it sends 16-bit by default. It
+runs from the radio's RAM (`/tmp`), so nothing is written to its flash and a reboot
+removes it. Tuning, gain and sample rate still go through `iiod`.
 
 ```sh
 pi/iqstream_test.sh             # builds it, then checks it (~2 minutes); --loopback-only: no radio
@@ -184,9 +187,10 @@ pi/iqstream_test.sh             # builds it, then checks it (~2 minutes); --loop
 The check runs in three stages:
 
 1. A loopback test on the Pi, checking every sample exactly.
-2. The radio sending a test pattern flat out: how much it can pack and send, with 1 and
-   2 connections.
-3. The radio's real samples at 19.2 and 21.6 MSPS, with 16-bit for comparison.
+2. The radio sending a test pattern at 21.6 MSPS: the network alone, with 1 and 2
+   connections.
+3. The radio's real samples at 19.2 and 21.6 MSPS, with 1 and 2 connections, and
+   12-bit for comparison.
 
 The other scripts use it with `--device packed:192.168.3.2` (or `bash pi/setup.sh --pluto
 packed:192.168.3.2`). The Pi builds it with Zig's C compiler, installed by setup with pip, which cross-compiles

@@ -1,10 +1,12 @@
-"""12-bit sample streaming from the Pluto through iqstream.
+"""Sample streaming from the Pluto through iqstream, in place of iiod.
 
-iiod sends the AD9361's 12-bit samples in 16-bit slots, and the radio's ARM
-core can't push 21.6 MSPS (86 MB/s) through TCP that way. iqstream (C, in
-radio/iqstream/) runs on the radio from RAM, reads the capture device
-directly, packs the samples to 12 bits (65 MB/s) and sends numbered chunks
-over 1-2 TCP connections from threads pinned to the radio's cores.
+iiod lands on whichever radio core the scheduler picks, sometimes the one that
+handles the Ethernet interrupts, and then tops out near 62 MB/s (15.5 MSPS).
+iqstream (C, in radio/iqstream/) runs on the radio from RAM, maps the DMA
+blocks and sends them, straight from the block, from threads pinned away from
+the interrupts: 81 MB/s (20.3 MSPS) measured with 1 connection, 16-bit.
+It can also pack to 12 bits (-f 12), but packing costs the radio's ARM more
+than the bytes it saves, so 16-bit is the default.
 
 PackedPluto has the same read / tune / flush / close / reconnect interface as
 atcsdr.pluto.Pluto, so the receivers take it as --device packed:<address>.
@@ -169,7 +171,7 @@ class PackedPluto:
     samples, and local=True runs build/iqstream-native on this computer."""
 
     def __init__(self, uri, center, rate, gain="40", bandwidth=None, buffer_size=1 << 17,
-                 conns=2, bits=12, cpus=None, password="analog", port=PORT,
+                 conns=1, bits=16, cpus=None, password="analog", port=PORT,
                  test_rate=None, local=False, capture="mmap", copy_first=False):
         self.uri, self.host = uri, uri.split(":", 1)[1]
         self.center, self.rate, self.gain = center, int(rate), gain

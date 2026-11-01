@@ -46,7 +46,6 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
-#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -102,7 +101,12 @@ static volatile sig_atomic_t running = 1;
 static uint64_t sent_chunks, dropped_chunks, overrange;
 static char iio_dir[300];
 static int iio_fd = -1;
-static pid_t tids[1 + MAX_CONNS];     /* reader, sender0, sender1: for the CPU report */
+/* Reader, sender0, sender1: handles for the CPU report while they run, and the
+ * CPU time each one used, saved by the thread itself as it finishes. */
+static pthread_t threads[1 + MAX_CONNS];
+static int started[1 + MAX_CONNS];
+static volatile int finished[1 + MAX_CONNS];
+static uint64_t cpu_used_ns[1 + MAX_CONNS];
 
 static void die(const char *fmt, ...)
 {
@@ -133,23 +137,30 @@ static void pin(int cpu)
         fprintf(stderr, "iqstream: couldn't pin a thread to core %d\n", cpu);
 }
 
-/* CPU time (ticks) a thread of this process has used, from /proc. */
-static long thread_ticks(pid_t tid)
+static uint64_t ts_ns(const struct timespec *ts)
 {
-    char path[64], buf[512];
-    snprintf(path, sizeof path, "/proc/self/task/%d/stat", (int)tid);
-    FILE *f = fopen(path, "r");
-    if (!f)
+    return (uint64_t)ts->tv_sec * 1000000000u + (uint64_t)ts->tv_nsec;
+}
+
+/* Called by each thread as it finishes: keep its CPU time for the final report. */
+static void save_cpu(int index)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    cpu_used_ns[index] = ts_ns(&ts);
+    finished[index] = 1;
+}
+
+/* CPU time a thread has used so far (ns), or -1. */
+static int64_t thread_cpu(int index)
+{
+    if (finished[index])
+        return (int64_t)cpu_used_ns[index];
+    clockid_t cid;
+    struct timespec ts;
+    if (!started[index] || pthread_getcpuclockid(threads[index], &cid) || clock_gettime(cid, &ts))
         return -1;
-    size_t n = fread(buf, 1, sizeof buf - 1, f);
-    fclose(f);
-    buf[n] = 0;
-    char *p = strrchr(buf, ')');
-    long utime = 0, stime = 0;
-    /* After the command name: state, then 10 fields, then utime, stime. */
-    if (!p || sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %ld %ld", &utime, &stime) != 2)
-        return -1;
-    return utime + stime;
+    return (int64_t)ts_ns(&ts);
 }
 
 /* ------------------------------------------------------------ IIO (sysfs) */
@@ -390,7 +401,6 @@ static void *reader(void *arg)
     uint64_t k = 0, produced = 0, start = now_ns();
     if (!scratch)
         die("out of memory");
-    tids[0] = (pid_t)syscall(SYS_gettid);
     pin(opt.cpu_reader);
     while (running) {
         if (opt.mmap_mode) {                    /* a DMA block is ready: hand it on */
@@ -448,6 +458,7 @@ static void *reader(void *arg)
     pthread_cond_broadcast(&filled);
     pthread_mutex_unlock(&mu);
     free(scratch);
+    save_cpu(0);
     return NULL;
 }
 
@@ -500,7 +511,6 @@ static void *sender(void *p)
     uint32_t *copy = opt.copy_first ? malloc(opt.samples * 4) : NULL;
     if (!out || (opt.copy_first && !copy))
         die("out of memory");
-    tids[1 + a->index] = (pid_t)syscall(SYS_gettid);
     pin(opt.cpu_sender[a->index]);
     for (;;) {
         struct slot *s = NULL;
@@ -541,6 +551,7 @@ static void *sender(void *p)
     }
     free(out);
     free(copy);
+    save_cpu(1 + a->index);
     return NULL;
 }
 
@@ -552,18 +563,18 @@ static void on_signal(int sig)
     running = 0;
 }
 
-static void report(const char *when, double secs, long *ticks0)
+/* Chunk counts, and each thread's CPU (% of a core) since the last report. */
+static void report(const char *when, double secs, int64_t *prev)
 {
     char cpu[160] = "";
     static const char *names[] = {"reader", "sender0", "sender1"};
-    long hz = sysconf(_SC_CLK_TCK);
     for (int i = 0; i < 1 + opt.conns; i++) {
-        long t = tids[i] ? thread_ticks(tids[i]) : -1;
+        int64_t t = thread_cpu(i);
         if (t >= 0 && secs > 0) {
             size_t len = strlen(cpu);
             snprintf(cpu + len, sizeof cpu - len, "%s%s %.0f%%", len ? ", " : "", names[i],
-                     100.0 * (double)(t - ticks0[i]) / (double)hz / secs);
-            ticks0[i] = t;
+                     100.0 * (double)(t - prev[i]) / 1e9 / secs);
+            prev[i] = t;
         }
     }
     fprintf(stderr, "iqstream: %s: %llu chunks sent, %llu dropped, %llu values over 12 bits; cpu: %s\n",
@@ -652,24 +663,23 @@ int main(int argc, char **argv)
                 die("out of memory (%d chunks of %zu samples)", opt.slots, opt.samples);
         }
 
-    pthread_t rt, st[MAX_CONNS];
     struct sender_arg args[MAX_CONNS];
     for (int i = 0; i < opt.conns; i++) {
         args[i].fd = fds[i];
         args[i].index = i;
-        pthread_create(&st[i], NULL, sender, &args[i]);
+        started[1 + i] = !pthread_create(&threads[1 + i], NULL, sender, &args[i]);
     }
-    pthread_create(&rt, NULL, reader, NULL);
+    started[0] = !pthread_create(&threads[0], NULL, reader, NULL);
 
     uint64_t t0 = now_ns(), last = t0;
-    long ticks5[1 + MAX_CONNS] = {0}, ticks_all[1 + MAX_CONNS] = {0};
+    int64_t since_last[1 + MAX_CONNS] = {0}, since_start[1 + MAX_CONNS] = {0};
     while (running) {
         sleep(1);
         uint64_t now = now_ns();
         if (now - last >= 5000000000u) {
             char when[32];
             snprintf(when, sizeof when, "%.0f s", (now - t0) / 1e9);
-            report(when, (now - last) / 1e9, ticks5);
+            report(when, (now - last) / 1e9, since_last);
             last = now;
         }
     }
@@ -679,12 +689,12 @@ int main(int argc, char **argv)
     pthread_mutex_unlock(&mu);
     for (int i = 0; i < opt.conns; i++)
         shutdown(fds[i], SHUT_RDWR);
-    report("done", total, ticks_all);
-    pthread_join(rt, NULL);
-    for (int i = 0; i < opt.conns; i++) {
-        pthread_join(st[i], NULL);
+    for (int i = 0; i < 1 + opt.conns; i++)
+        if (started[i])
+            pthread_join(threads[i], NULL);
+    for (int i = 0; i < opt.conns; i++)
         close(fds[i]);
-    }
+    report("done", total, since_start);          /* every thread has saved its CPU time */
     iio_stop();
     return 0;
 }
