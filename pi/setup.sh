@@ -149,8 +149,8 @@ EOF
     # numba: compiled, multi-core DSP (radio/dsp_bench.py). pyModeS: ADS-B decoding.
     # ziglang: the C compiler that builds iqstream for the radio (pi/build_iqstream.sh).
     # shellcheck disable=SC2086
-    "$PY" -m pip install -q noisereduce numba "pyModeS>=3" ziglang $PIP_IIO
-    ok "noisereduce, numba, pyModeS, ziglang${PIP_IIO:+, $PIP_IIO} installed"
+    "$PY" -m pip install -q noisereduce numba "pyModeS>=3" ziglang pytest $PIP_IIO
+    ok "noisereduce, numba, pyModeS, ziglang, pytest${PIP_IIO:+, $PIP_IIO} installed"
 
     say "iqstream (12-bit sample streamer for the radio)"
     bash "$ROOT/pi/build_iqstream.sh" && ok "built build/iqstream-armhf"         || warn "couldn't build iqstream (only needed for --device packed:...)"

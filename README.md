@@ -14,6 +14,7 @@ Tools for listening to, recording and decoding Bay Area air traffic with an ADAL
 | [radio/bay_all.py](radio/bay_all.py) | Surveys all 43 Bay Area channels to see what you can pick up |
 | [radio/record.py](radio/record.py), [pi/record.sh](pi/record.sh) | Records any channel set for a set time, unattended (e.g. on a Raspberry Pi) |
 | [radio/linkwatch.py](radio/linkwatch.py), [pi/linktest.sh](pi/linktest.sh) | Watches the Pi-Pluto link for hours and logs every drop, stall and reconnect |
+| [pi/full_test.sh](pi/full_test.sh) | The whole check in order: setup, tests, build, the Pi alone, then the real station test; one report |
 | [radio/station_test.py](radio/station_test.py), [pi/station_test.sh](pi/station_test.sh) | ATC and ADS-B together on the planned core layout: uptime of each, per-core load, storage |
 | [radio/adsb_listen.py](radio/adsb_listen.py), [pi/adsb_listen.sh](pi/adsb_listen.sh) | ADS-B from the RTL-SDR for a set time: messages, tracks, health log, uptime |
 | [radio/atc_listen.py](radio/atc_listen.py), [pi/atc_listen.sh](pi/atc_listen.sh) | Listens to all 43 channels at once (full stack, 20.0 MSPS) for a set time: MP3 per transmission, health log, uptime |
@@ -194,6 +195,24 @@ In `recordings/listen_<UTC time>/`:
 - `events.csv`: reconnects.
 - `summary.txt`: the uptime (the share of seconds fully received and kept up with),
   per-channel traffic, and the storage used, projected to a day, a week and a month.
+
+#### Everything at once: `pi/full_test.sh`
+
+```sh
+pi/full_test.sh 1h --ref 37.43 -122.17        # 30m by default; 8h overnight (in tmux)
+```
+
+This runs the whole check in order and ends with one pass/fail report, in
+`recordings/fulltest_<UTC time>/report.txt`:
+
+1. The setup check.
+2. The test suite.
+3. The iqstream build.
+4. Two minutes of the station test with synthetic signals: can the Pi keep up on its own?
+5. The real station test, for the duration given.
+
+A failed step doesn't stop the rest. The report lists each step's result and time, then the
+key lines (uptime, load, storage) from both station runs.
 
 #### ADS-B listen test, and the station test (both at once)
 
