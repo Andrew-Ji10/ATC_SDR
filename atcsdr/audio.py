@@ -59,6 +59,25 @@ def save_clip(audio, path_base, rate, mp3, title):
     return paths
 
 
+def save_mp3(audio, path, rate, lame, title, comment="", kbps=32):
+    """Write audio (float, +-1) straight to an MP3 at `path` (mono, `kbps`), with
+    an ID3 title and comment; no WAV. Without lame, a WAV next to it instead.
+    Returns the path written."""
+    pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+    if not lame:
+        wav_path = os.path.splitext(path)[0] + ".wav"
+        with wave.open(wav_path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(pcm.tobytes())
+        return wav_path
+    subprocess.run([lame, "--quiet", "-r", "-s", f"{rate / 1000:g}", "--bitwidth", "16", "--signed",
+                    "--little-endian", "-m", "m", "-b", str(kbps), "--tt", title, "--tc", comment,
+                    "-", path], input=pcm.tobytes(), check=True)
+    return path
+
+
 def load_wav(path):
     with wave.open(path) as w:
         rate = w.getframerate()

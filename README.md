@@ -14,6 +14,7 @@ Tools for listening to, recording and decoding Bay Area air traffic with an ADAL
 | [radio/bay_all.py](radio/bay_all.py) | Surveys all 43 Bay Area channels to see what you can pick up |
 | [radio/record.py](radio/record.py), [pi/record.sh](pi/record.sh) | Records any channel set for a set time, unattended (e.g. on a Raspberry Pi) |
 | [radio/linkwatch.py](radio/linkwatch.py), [pi/linktest.sh](pi/linktest.sh) | Watches the Pi-Pluto link for hours and logs every drop, stall and reconnect |
+| [radio/atc_listen.py](radio/atc_listen.py), [pi/atc_listen.sh](pi/atc_listen.sh) | Listens to all 43 channels at once (full stack, 20.0 MSPS) for a set time: MP3 per transmission, health log, uptime |
 | [radio/iqstream/iqstream.c](radio/iqstream/iqstream.c), [pi/iqstream_test.sh](pi/iqstream_test.sh) | The streamer for the radio, faster than `iiod` (`--device packed:...`), and its check |
 | [radio/link_diag.py](radio/link_diag.py), [pi/linkdiag.sh](pi/linkdiag.sh) | Finds why the Pluto can't stream 21.6 MSPS: radio capture, network stack or iiod |
 | [radio/dsp_bench.py](radio/dsp_bench.py), [pi/dspbench.sh](pi/dspbench.sh) | Benchmarks the DSP for the whole band in one window (21.6 MSPS), single- and multi-core |
@@ -167,6 +168,30 @@ runs three tests to find the bottleneck, reading the radio's CPU load over SSH a
 The verdict says which part is the limit and what would fix it: buffer settings, a
 newer `iiod`, a custom streaming program on the radio (12-bit samples need 65 MB/s), or
 processing on the radio's FPGA.
+
+#### ATC listen test: the whole band, full stack
+
+```sh
+pi/atc_listen.sh 30m            # 10m by default; 8h overnight; --threshold 10, --no-clean
+```
+
+This listens to all 43 channels at once, in one window at 20.0 MSPS. At that rate the
+outermost channels (118.000 and 135.650 MHz) use 88% of the captured band. The samples
+come from the radio through `iqstream`. On cores 0-1, the compiled channelizer
+([atcsdr/fastrx.py](atcsdr/fastrx.py)) splits the band into 800 channels on the 25 kHz grid
+and demodulates the 43, and each has its own squelch. Each transmission is saved as a plain
+and a cleaned MP3 (16 kHz, 32 kbps, speech quality) by a worker on core 3, named and tagged
+with its UTC start time, e.g. `clips/2026-11-01T03-12-05.250Z_120.500MHz_SFO_Twr.mp3`.
+
+In `recordings/listen_<UTC time>/`:
+
+- `transmissions.csv`: every transmission.
+- `health.csv`: one row per second: the % of samples received, how busy the receiver was
+  (1.00 = all of real time), its backlog, chunks dropped or lost, reconnects, clips
+  waiting, and the CPU temperature.
+- `events.csv`: reconnects.
+- `summary.txt`: the uptime (the share of seconds fully received and kept up with),
+  per-channel traffic, and the storage used, projected to a day, a week and a month.
 
 #### iqstream: a faster streamer than iiod
 
