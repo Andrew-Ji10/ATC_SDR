@@ -37,7 +37,9 @@ from atcsdr import pluto
 
 TARGET = 21_600_000          # one window over all 43 channels
 BYTES_PER_SAMPLE = 4         # int16 I + int16 Q
-BUFFERS = [(1 << 17, 8), (1 << 19, 8), (1 << 21, 4)]   # (samples per buffer, kernel buffers)
+# (samples per buffer, kernel buffers) tried at 21.6 MSPS. Smaller buffers did better
+# on the first run (131072: 83%, 524288: 72%), so the sweep goes smaller too.
+BUFFERS = [(1 << 15, 16), (1 << 16, 16), (1 << 17, 8), (1 << 17, 16), (1 << 19, 8), (1 << 21, 4)]
 DEFAULT_BUFFER = (1 << 19, 8)                          # what the recorder uses
 TCP_PORT = 5201
 
@@ -165,64 +167,123 @@ def local_ip_toward(host):
         return s.getsockname()[0]
 
 
-def test_tcp(rep, radio, seconds):
-    rep.section("B. Plain TCP from the radio (dd /dev/zero | nc), no iiod")
-    nc = "nc" if radio.run("which nc").returncode == 0 else "busybox nc"
+def has_applet(radio, name):
+    return radio.run(f"which {name} >/dev/null 2>&1 || "
+                     f"busybox --list 2>/dev/null | grep -qx {name}").returncode == 0
+
+
+def measure_receive(radio, recv, seconds):
+    """Call recv() (bytes received; 0 = the stream ended) flat out, and measure from
+    1 s in (past TCP slow start) for `seconds`. The radio's CPU snapshots run on
+    threads, so the receive loop never pauses. Returns (MB/s, radio load, this
+    computer's % of a core), or None if the stream ended early."""
+    total, start, mark, mark_bytes, end, end_bytes = 0, None, None, 0, None, 0
+    snaps, threads = {}, {}
+
+    def snap(key):
+        threads[key] = threading.Thread(target=lambda: snaps.__setitem__(key, radio.snapshot()),
+                                        daemon=True)
+        threads[key].start()
+
+    t_pi = os.times()
+    while True:
+        n = recv()
+        if not n:
+            break
+        now = time.time()
+        start = start or now
+        total += n
+        if mark is None and now - start >= 1:
+            snap(0)
+            mark, mark_bytes = now, total
+        if mark is not None and end is None and now - mark >= seconds:
+            snap(1)
+            end, end_bytes = now, total
+        if end is not None and not threads[1].is_alive():
+            break
+    if end is None:
+        return None
+    threads[0].join()
+    if 0 not in snaps or 1 not in snaps:
+        return None
+    t1 = os.times()
+    pi_cpu = 100 * (t1.user + t1.system - t_pi.user - t_pi.system) / (end - start)
+    return (end_bytes - mark_bytes) / (end - mark) / 1e6, Radio.load(snaps[0], snaps[1])[0], pi_cpu
+
+
+def tcp_nc(radio, seconds):
+    """The radio sends /dev/zero with nc to a socket on this computer."""
     me = local_ip_toward(radio.host)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((me, TCP_PORT))
     srv.listen(1)
     srv.settimeout(15)
-    sender = radio.popen(f"dd if=/dev/zero bs=65536 count=200000 2>/dev/null | {nc} {me} {TCP_PORT}")
+    sender = radio.popen(f"dd if=/dev/zero bs=65536 count=200000 2>/dev/null | nc {me} {TCP_PORT}")
     try:
         conn, _ = srv.accept()
     except socket.timeout:
         sender.kill()
-        rep(f"  the radio couldn't connect back to {me}:{TCP_PORT} "
-            f"(firewall? {sender.stderr.read()[:200] if sender.poll() is not None else ''})")
-        return None
+        return f"the radio couldn't connect back to {me}:{TCP_PORT} (a firewall on this computer?)"
     conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 << 20)
     buf = bytearray(1 << 20)
-    total, start, mark, mark_bytes, end = 0, None, None, 0, None
-    snaps = {}
+    try:
+        return measure_receive(radio, lambda: conn.recv_into(buf), seconds)
+    finally:
+        conn.close()
+        srv.close()
+        sender.kill()
 
-    def snap(key):                           # over SSH, without pausing the receive loop
-        th = threading.Thread(target=lambda: snaps.__setitem__(key, radio.snapshot()), daemon=True)
-        th.start()
-        return th
 
-    t_pi = os.times()
-    while True:
-        n = conn.recv_into(buf)
-        if not n:
-            break
-        now = time.time()
-        if start is None:
-            start = now
-        total += n
-        # Measure from 1 s in (past TCP slow start) for `seconds`.
-        if mark is None and now - start >= 1:
-            th0, mark, mark_bytes = snap(0), now, total
-        if mark is not None and end is None and now - mark >= seconds:
-            th1, end, end_bytes = snap(1), now, total
-        if end is not None and not th1.is_alive():
-            break
-    if mark is not None and end is not None:
-        th0.join()
-        s0, s1, t_end = snaps.get(0), snaps.get(1), end
+def tcp_httpd(radio, seconds, port=8099):
+    """busybox httpd on the radio serves a 64 MB file from RAM (tmpfs), fetched over and over."""
+    pid = radio.run("mkdir -p /tmp/linkdiag && "
+                    "dd if=/dev/zero of=/tmp/linkdiag/z bs=1048576 count=64 2>/dev/null && "
+                    f"(httpd -f -p {port} -h /tmp/linkdiag </dev/null >/dev/null 2>&1 & echo $!)").stdout.strip()
+    if not pid.isdigit():
+        return "couldn't start httpd on the radio"
+    time.sleep(0.5)
+    buf = bytearray(1 << 20)
+    state = {"sock": None}
+
+    def recv():
+        while True:
+            if state["sock"] is None:
+                s = socket.create_connection((radio.host, port), timeout=10)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 << 20)
+                s.sendall(b"GET /z HTTP/1.0\r\nHost: radio\r\n\r\n")
+                state["sock"] = s
+            n = state["sock"].recv_into(buf)
+            if n:
+                return n
+            state["sock"].close()                  # that copy is done: fetch it again
+            state["sock"] = None
+
+    try:
+        return measure_receive(radio, recv, seconds)
+    except OSError as e:
+        return f"couldn't download from the radio's httpd: {e}"
+    finally:
+        if state["sock"] is not None:
+            state["sock"].close()
+        radio.run(f"kill {pid}; rm -rf /tmp/linkdiag")
+
+
+def test_tcp(rep, radio, seconds):
+    if has_applet(radio, "nc"):
+        rep.section("B. Plain TCP from the radio (dd /dev/zero | nc), no iiod")
+        res = tcp_nc(radio, seconds)
+    elif has_applet(radio, "httpd"):
+        rep.section("B. Plain TCP from the radio (busybox httpd, a file in RAM), no iiod")
+        res = tcp_httpd(radio, seconds)
     else:
-        mark = None
-    conn.close()
-    srv.close()
-    sender.kill()
-    if mark is None or s0 is None or s1 is None:
-        rep(f"  the stream ended early ({total / 1e6:.0f} MB)")
+        rep.section("B. Plain TCP from the radio, no iiod")
+        rep("  the radio has neither nc nor httpd: skipped")
         return None
-    mbps = (end_bytes - mark_bytes) / (t_end - mark) / 1e6
-    t1 = os.times()
-    pi_cpu = 100 * (t1.user + t1.system - t_pi.user - t_pi.system) / (t_end - start)
-    busy, _ = Radio.load(s0, s1)
+    if isinstance(res, str) or res is None:
+        rep(f"  {res or 'the stream ended early'}")
+        return None
+    mbps, busy, pi_cpu = res
     rep(f"  {mbps:.0f} MB/s ({mbps * 8:.0f} Mb/s) = {mbps / BYTES_PER_SAMPLE:.1f} MSPS worth of "
         f"16-bit samples; {TARGET / 1e6:g} MSPS needs {TARGET * BYTES_PER_SAMPLE / 1e6:.0f} MB/s")
     rep(f"  {fmt_load(busy)}; this computer {pi_cpu:.0f}% of one core")
@@ -323,15 +384,30 @@ def verdict(rep, capture, tcp, results):
                 + (f" (it uses {best['iiod']:.0f}% of a radio core)" if best else "") + ".")
             rep("   Fixes, easiest first: a newer libiio/iiod on the radio (firmware update); "
                 "a small custom streaming program on the radio in place of iiod.")
+    elif best and best["iiod"] >= 85:
+        # No plain-TCP number: judge from iiod's own load.
+        cores = sorted(best["busy"].values(), reverse=True)
+        rep(f"-> iiod uses {best['iiod']:.0f}% of one radio core at {TARGET / 1e6:g} MSPS, while the "
+            f"radio's capture path {'keeps up' if capture else 'was not tested'} and this computer is "
+            f"nearly idle ({best['pi']:.0f}% of a core): iiod is CPU-bound on the radio. It works on one "
+            f"core at a time"
+            + (f"; the other was {cores[1]:.0f}% busy." if len(cores) > 1 else "."))
+        got_mb = best["got"] * TARGET * BYTES_PER_SAMPLE / 1e6
+        packed = TARGET * 3 / 1e6
+        rep(f"   Fixes, easiest first: the best buffer settings (below); a newer iiod (libiio 1.x, in "
+            f"newer firmware); a custom streaming program on the radio, which could also pack samples "
+            f"to 12 bits ({packed:.0f} MB/s instead of {need:.0f}; iiod managed {got_mb:.0f} MB/s at best); "
+            f"or processing on the radio's FPGA, sending just the channels.")
     if best:
         busy = best["busy"]
         if busy and max(busy.values()) > 90:
             rep(f"   During the {TARGET / 1e6:g} MSPS stream a radio core was {max(busy.values()):.0f}% busy: "
                 "the radio's CPU is saturated.")
-        sizes = sorted((r for r in at_target), key=lambda r: r["buffer"])
-        if len(sizes) > 1 and sizes[-1]["got"] - sizes[0]["got"] > 0.05:
-            rep(f"   Larger buffers help: {100 * sizes[0]['got']:.0f}% at {sizes[0]['buffer']} samples -> "
-                f"{100 * sizes[-1]['got']:.0f}% at {sizes[-1]['buffer']}.")
+        default = next((r for r in at_target if (r["buffer"], r["kbufs"]) == DEFAULT_BUFFER), None)
+        if default and best is not default and best["got"] - default["got"] > 0.03:
+            rep(f"   Buffer size matters: {100 * default['got']:.0f}% with the recorder's "
+                f"{default['buffer']} samples x {default['kbufs']}, {100 * best['got']:.0f}% with "
+                f"{best['buffer']} x {best['kbufs']}: the recorder should use the latter.")
 
 
 def main():
