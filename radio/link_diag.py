@@ -87,18 +87,35 @@ class Radio:
                                 stderr=subprocess.PIPE, text=True)
 
     def snapshot(self):
-        """CPU ticks per core, and iiod's, right now."""
-        out = self.run("cat /proc/stat; for p in $(pidof iiod); do echo IIOD $(cat /proc/$p/stat); done").stdout
-        cores, iiod = {}, 0
+        """Right now: (busy and total ticks per core, iiod's ticks, each core's /proc/stat
+        fields, and the NET_TX / NET_RX softirq counts per core)."""
+        out = self.run("cat /proc/stat; for p in $(pidof iiod); do echo IIOD $(cat /proc/$p/stat); done; "
+                       "cat /proc/softirqs").stdout
+        cores, iiod, fields, soft = {}, 0, {}, {}
         for line in out.splitlines():
+            parts = line.split()
             if line.startswith("cpu") and len(line) > 3 and line[3].isdigit():
-                name, *v = line.split()
+                name, *v = parts
                 v = list(map(int, v[:8]))
-                cores[name] = (sum(v) - v[3] - v[4], sum(v))
+                cores[name], fields[name] = (sum(v) - v[3] - v[4], sum(v)), v
             elif line.startswith("IIOD"):
                 f = line.split(")")[-1].split()       # fields after the command name
                 iiod += int(f[11]) + int(f[12])       # utime + stime
-        return cores, iiod
+            elif parts and parts[0] in ("NET_TX:", "NET_RX:"):
+                soft[parts[0][:-1]] = {f"cpu{i}": int(n) for i, n in enumerate(parts[1:])}
+        return cores, iiod, fields, soft
+
+    @staticmethod
+    def breakdown(s0, s1):
+        """{core: (program %, kernel %, network softirq + irq %)} between two snapshots."""
+        out = {}
+        for k, v1 in s1[2].items():
+            v0 = s0[2].get(k)
+            if v0:
+                d = [b - a for a, b in zip(v0, v1)]
+                total = max(1, sum(d))
+                out[k] = (100 * (d[0] + d[1]) / total, 100 * d[2] / total, 100 * (d[5] + d[6]) / total)
+        return out
 
     @staticmethod
     def load(s0, s1):
@@ -318,8 +335,11 @@ def stream(uri, rate, buffer, kbufs, seconds, radio):
     th.join(timeout=10)
     r.close()
     busy, iiod = Radio.load(s0, s1)
+    soft = {kind: {c: (s1[3][kind][c] - s0[3][kind].get(c, 0)) / (t1 - t0) for c in s1[3][kind]}
+            for kind in s1[3] if kind in s0[3]} if len(s1) > 3 else {}
     return dict(got=(n1 - n0) / ((t1 - t0) * rate), busy=busy, iiod=iiod, error=err[0] if err else None,
-                pi=100 * (c1.user + c1.system - c0.user - c0.system) / (t1 - t0))
+                pi=100 * (c1.user + c1.system - c0.user - c0.system) / (t1 - t0),
+                detail=Radio.breakdown(s0, s1) if len(s1) > 2 else {}, soft=soft)
 
 
 def test_stream(rep, radio, uri, rates, seconds):
@@ -427,10 +447,109 @@ def test_steering(rep, radio, uri, rates, buffer, kbufs, seconds):
     return results
 
 
+# ------------------------------------------------------------------ E
+
+SYSCTLS = {"wmem": "/proc/sys/net/ipv4/tcp_wmem",
+           "cork": "/proc/sys/net/ipv4/tcp_autocorking",
+           "limit": "/proc/sys/net/ipv4/tcp_limit_output_bytes"}
+TUNINGS = [("as is", {}),
+           ("send buffer up to 128k", {"wmem": "4096 65536 131072"}),
+           ("send buffer up to 64k", {"wmem": "4096 32768 65536"}),
+           ("send buffer up to 4M", {"wmem": "4096 1048576 4194304"}),
+           ("autocorking off", {"cork": "0"}),
+           ("output limit 64k", {"limit": "65536"}),
+           ("output limit 1M", {"limit": "1048576"})]
+
+
+def fmt_detail(res):
+    """'cpu0 u12 k40 n30 | cpu1 ...': program, kernel and network (irq + softirq) % per core."""
+    return " | ".join(f"{c} u{u:2.0f} k{k:2.0f} n{n:2.0f}" for c, (u, k, n) in sorted(res["detail"].items()))
+
+
+def fmt_soft(res):
+    rx = res["soft"].get("NET_RX", {})
+    return "NET_RX/s " + " ".join(f"{c} {v / 1000:.0f}k" for c, v in sorted(rx.items())) if rx else ""
+
+
+def test_tuning(rep, radio, uri, rates, tune_rate, buffer, kbufs, seconds):
+    rep.section("E. Where the radio's network work runs, and TCP tuning on the radio")
+    rep(f"  per core: u = program, k = kernel, n = network interrupts + softirqs (% of the core); "
+        f"buffer {buffer} x {kbufs}")
+    rows = []
+    for rate in rates:
+        res = stream(uri, rate, buffer, kbufs, seconds, radio)
+        if "got" in res:
+            res.update(name="as is", rate=rate, buffer=buffer, kbufs=kbufs, part="where")
+            rows.append(res)
+            rep(f"  {rate / 1e6:5.1f} MSPS  {100 * res['got']:4.0f}%  {res['got'] * rate / 1e6:4.1f} MSPS  "
+                f"iiod {res['iiod']:3.0f}%  {fmt_detail(res)}  {fmt_soft(res)}")
+    orig = {k: radio.run(f"cat {path} 2>/dev/null").stdout.strip() for k, path in SYSCTLS.items()}
+    rep(f"  TCP settings now: " + "; ".join(f"{SYSCTLS[k].split('/')[-1]} = {v or 'n/a'}" for k, v in orig.items()))
+    rep(f"  -- one setting at a time, at {tune_rate / 1e6:g} MSPS (each restored right after):")
+    try:
+        for name, changes in TUNINGS:
+            if any(not orig.get(k) for k in changes):
+                rep(f"  {name}: not available on this kernel, skipped")
+                continue
+            for k, v in changes.items():
+                radio.run(f"echo '{v}' > {SYSCTLS[k]}")
+            res = stream(uri, tune_rate, buffer, kbufs, seconds, radio)
+            for k in changes:
+                radio.run(f"echo '{orig[k]}' > {SYSCTLS[k]}")
+            if "got" not in res:
+                rep(f"  {name}: couldn't open the stream")
+                continue
+            res.update(name=name, rate=tune_rate, buffer=buffer, kbufs=kbufs, part="tune")
+            rows.append(res)
+            rep(f"  {name:<24} {100 * res['got']:4.0f}%  {res['got'] * tune_rate / 1e6:4.1f} MSPS  "
+                f"{res['got'] * tune_rate * BYTES_PER_SAMPLE / 1e6:3.0f} MB/s  iiod {res['iiod']:3.0f}%  "
+                f"{fmt_detail(res)}")
+    finally:
+        for k, v in orig.items():
+            if v:
+                radio.run(f"echo '{v}' > {SYSCTLS[k]}")
+        rep("  (original TCP settings restored)")
+    return rows
+
+
+def explain_tuning(rep, rows):
+    """The theory: below capacity the other core does the network work; above it, it all
+    lands on iiod's core. And did any TCP setting help?"""
+    where = sorted((r for r in rows if r["part"] == "where" and r["detail"]), key=lambda r: r["rate"])
+    if len(where) >= 2:
+        def other_core_net(r):
+            # The core doing least program + kernel work is the one iiod isn't on.
+            core = min(r["detail"], key=lambda c: r["detail"][c][0] + r["detail"][c][1])
+            return r["detail"][core][2], core
+        good, bad = where[0], where[-1]
+        (g_net, g_core), (b_net, b_core) = other_core_net(good), other_core_net(bad)
+        rep(f"network work on the core iiod isn't on: {g_net:.0f}% at {good['rate'] / 1e6:g} MSPS "
+            f"({100 * good['got']:.0f}% delivered) vs {b_net:.0f}% at {bad['rate'] / 1e6:g} MSPS "
+            f"({100 * bad['got']:.0f}% delivered)")
+        if g_net - b_net > 10:
+            rep("-> Confirmed: below capacity the second core takes the network work; once iiod is "
+                "always busy, it all runs on iiod's core and throughput drops.")
+        else:
+            rep("-> Not confirmed: the network work doesn't move between cores like that; "
+                "something else causes the drop.")
+    tune = [r for r in rows if r["part"] == "tune"]
+    base = next((r for r in tune if r["name"] == "as is"), None)
+    best = max((r for r in tune if r["name"] != "as is"), key=lambda r: r["got"], default=None)
+    if base and best:
+        rep(f"best TCP setting at {best['rate'] / 1e6:g} MSPS: {best['name']}, "
+            f"{100 * base['got']:.0f}% -> {100 * best['got']:.0f}% delivered"
+            + ("" if best["got"] - base["got"] > 0.03 else "  (no real change)"))
+        if best["got"] >= 0.99:
+            rep(f"-> With '{best['name']}', {best['rate'] / 1e6:g} MSPS gets through in full: the recorder "
+                "can apply it on the radio at start-up (it resets on reboot).")
+
+
 # ------------------------------------------------------------------ verdict
 
-def verdict(rep, capture, tcp, results, steered=()):
+def verdict(rep, capture, tcp, results, steered=(), tuned=()):
     rep.section("Verdict")
+    explain_tuning(rep, tuned)
+    results = list(results) + [r for r in tuned if r["name"] != "as is"]
     for rate in sorted({r["rate"] for r in steered}):
         as_is = next((r for r in steered if r["name"] == "as is" and r["rate"] == rate), None)
         moved = max((r for r in steered if r["name"] != "as is" and r["rate"] == rate),
@@ -528,6 +647,7 @@ def main():
     p.add_argument("--rates", type=float, nargs="+", default=[10.8, 14.4, 18.0, 19.2, 21.6],
                    help="MSPS to stream in test C (default 10.8 14.4 18.0 19.2 21.6)")
     p.add_argument("--no-steering", action="store_true", help="skip test D")
+    p.add_argument("--no-tuning", action="store_true", help="skip test E")
     p.add_argument("--seconds", type=float, default=6.0, help="seconds per measurement (default 6)")
     p.add_argument("--out", help="output folder (default recordings/linkdiag_<time>)")
     args = p.parse_args()
@@ -558,7 +678,12 @@ def main():
         b = max(at_target, key=lambda r: r["got"])
         d_rates = [r for r in rates if r == 19_200_000] + [TARGET]   # the whole-band rates
         steered = test_steering(rep, radio, uri, d_rates, b["buffer"], b["kbufs"], args.seconds)
-    verdict(rep, capture, tcp, results, steered)
+    tuned = []
+    if not args.no_tuning:
+        tune_rate = 19_200_000 if 19_200_000 in rates else TARGET
+        where = [r for r in (18_000_000, tune_rate, TARGET) if r in rates]
+        tuned = test_tuning(rep, radio, uri, sorted(set(where)), tune_rate, *DEFAULT_BUFFER, args.seconds)
+    verdict(rep, capture, tcp, results, steered, tuned)
 
     out = Path(args.out or ROOT / f"recordings/linkdiag_{datetime.now():%Y%m%d-%H%M%S}")
     out.mkdir(parents=True, exist_ok=True)

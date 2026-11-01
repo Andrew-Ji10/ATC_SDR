@@ -157,6 +157,11 @@ runs three tests to find the bottleneck, reading the radio's CPU load over SSH a
   interrupts on one core and `iiod` on the other, both ways round. The original
   placement is put back afterwards, and it resets on reboot anyway. Skip it with
   `--no-steering`.
+- **E.** Where the radio's network work runs, and TCP tuning. It streams at 18, 19.2 and
+  21.6 MSPS, showing each radio core's split between program, kernel and network
+  (softirq) time. Then it tries TCP settings one at a time at 19.2 MSPS: send buffer
+  sizes, autocorking, and the output limit. Each is restored right after, and all of
+  them reset on reboot. Skip it with `--no-tuning`.
 
 The verdict says which part is the limit and what would fix it: buffer settings, a
 newer `iiod`, a custom streaming program on the radio (12-bit samples need 65 MB/s), or
