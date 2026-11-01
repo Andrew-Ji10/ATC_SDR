@@ -227,6 +227,8 @@ time. In `recordings/adsb_<UTC time>/`:
 - `messages.txt.gz`: every message, as `<unix time> <hex>`; decode it again with
   `adsb/adsb_decode.py --hex`.
 - `positions.csv`, `aircraft.csv`: the tracks and the aircraft seen.
+- `sightings.csv`: each new aircraft's first position, which is also printed as it
+  happens.
 - `health.csv`: one row per second: the % of samples received, decoder load, drops,
   messages per second, aircraft in view.
 - `summary.txt`: uptime, traffic, and storage per day, week and month.
@@ -239,7 +241,9 @@ dongle, with `--rtl`.
 - ATC on cores 0-1, with its clips on core 3.
 - ADS-B on core 2.
 
-One status line shows both systems and each core's load. The summary gives each
+A line appears for each ATC transmission saved and for each new aircraft, with its callsign,
+altitude, position and distance from `--ref`. One status line shows both systems, the clips
+and aircraft so far, and each core's load. The summary gives each
 system's uptime, every core's average and peak load, temperature and throttling, and the
 storage for both. Each test's own files are in `atc/` and `adsb/`, and `cores.csv` logs the
 cores every 5 s. With `--atc-source synthetic --adsb-source synthetic` it runs with no

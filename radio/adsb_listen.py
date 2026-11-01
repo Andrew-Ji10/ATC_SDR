@@ -8,6 +8,8 @@ ADS-B listen test: decode and track aircraft from the RTL-SDR for a set time.
     python3 radio/adsb_listen.py --duration 30m --ref 37.43 -122.17
     python3 radio/adsb_listen.py --source synthetic --duration 2m     # no dongle needed
 
+Prints a line for each new aircraft, when it first has a position (callsign,
+altitude, position, distance from --ref), and logs those to sightings.csv.
 Saves, in recordings/adsb_<UTC time>/: messages.txt.gz (every message as
 '<unix time> <hex>', for decoding again with adsb_decode.py --hex), positions.csv
 (every position fix), aircraft.csv (one row per aircraft), health.csv (every
@@ -19,6 +21,7 @@ decode from the first message.
 
 import argparse
 import gzip
+import math
 import os
 import queue
 import shutil
@@ -71,6 +74,13 @@ def temp_c():
 
 def _terminate(*_):
     raise KeyboardInterrupt
+
+
+def km_between(a, b):
+    """Great-circle distance between (lat, lon) points, km."""
+    la1, lo1, la2, lo2 = map(math.radians, (*a, *b))
+    h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
+    return 2 * 6371 * math.asin(math.sqrt(h))
 
 
 class SyntheticSource:
@@ -139,6 +149,19 @@ def main():
     messages = open(out / "messages.txt", "w", buffering=1 << 16)
     health = open(out / "health.csv", "w", buffering=1)
     health.write("time_utc,stream_pct,decoder_busy,backlog,dropped,msgs_per_s,aircraft_in_view,cpu_c\n")
+    sightings = open(out / "sightings.csv", "w", buffering=1)
+    sightings.write("time_utc,icao,callsign,altitude_ft,lat,lon,km_away\n")
+    sighted = set()
+
+    def sighting(when, ac):
+        """A new aircraft's first position: one line on screen and in sightings.csv."""
+        km = km_between(args.ref, (ac.lat, ac.lon)) if args.ref else None
+        sightings.write(f"{utc(when)},{ac.icao},{ac.callsign or ''},{ac.altitude or ''},{ac.lat:.5f},"
+                        f"{ac.lon:.5f},{'' if km is None else f'{km:.1f}'}\n")
+        print(("\r\033[K" if TTY else "") + f"{utc(when, ms=False)}  aircraft {ac.icao} "
+              f"{(ac.callsign or '-'):<8} {(str(ac.altitude) + ' ft') if ac.altitude else '':>9}  "
+              f"{ac.lat:.4f}, {ac.lon:.4f}" + (f"  {km:.0f} km away" if km is not None else ""), flush=True)
+
     events = open(out / "events.csv", "w", buffering=1)
     events.write("time,event\n")
 
@@ -227,7 +250,12 @@ def main():
             t = time.perf_counter()
             for offset, msg in demod.process(to_complex(raw)):
                 when = t_start + offset / RATE
-                tracker.add(when, msg)
+                d = tracker.add(when, msg)
+                if d and d["icao"] not in sighted:
+                    ac = tracker.aircraft.get(d["icao"])
+                    if ac is not None and ac.lat is not None:
+                        sighted.add(d["icao"])
+                        sighting(when, ac)
                 messages.write(f"{when:.6f} {msg}\n")
                 stats["msgs"] += 1
             stats["busy"] += time.perf_counter() - t
@@ -268,6 +296,7 @@ def main():
     (out / "summary.txt").write_text(report + "\n")
     health.close()
     events.close()
+    sightings.close()
 
 
 if __name__ == "__main__":

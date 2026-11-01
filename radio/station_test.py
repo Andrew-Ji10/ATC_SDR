@@ -12,8 +12,9 @@ temperature and throttling, and the storage used per day / week / month.
     python3 radio/station_test.py ... --adsb-source synthetic     # without the dongle
     python3 radio/station_test.py --atc-source synthetic --adsb-source synthetic   # no radios at all
 
-While it runs, one status line shows both systems (stream %, load, uptime, ADS-B
-messages and aircraft) and each core's load. Output in recordings/station_<UTC>/:
+While it runs, a line appears for each ATC transmission saved and each new
+aircraft (with its position), and one status line shows both systems (stream %,
+load, clips and aircraft so far) and each core's load. Output in recordings/station_<UTC>/:
 atc/ and adsb/ (each test's own files and summary), atc.log, adsb.log, cores.csv
 (each core's load every 5 s) and summary.txt (both together). Ctrl-C stops both
 cleanly.
@@ -82,6 +83,36 @@ def last_row(path):
     return dict(zip(header, lines[-1].split(",")))
 
 
+class Follow:
+    """New complete lines of a CSV that another process is writing, as dicts."""
+
+    def __init__(self, path):
+        self.path, self.pos, self.header, self.count = path, 0, None, 0
+
+    def new(self):
+        try:
+            with open(self.path, "rb") as f:              # bytes: positions stay exact
+                f.seek(self.pos)
+                data = f.read()
+        except OSError:
+            return []
+        done = data[: data.rfind(b"\n") + 1]             # only whole lines
+        self.pos += len(done)
+        rows = []
+        for line in done.decode(errors="replace").splitlines():
+            if self.header is None:
+                self.header = line.split(",")
+                continue
+            rows.append(dict(zip(self.header, line.split(","))))
+        self.count += len(rows)
+        return rows
+
+
+def clock(t):
+    """'2026-11-01T04:25:13.250Z' -> '04:25:13Z'."""
+    return t[11:19] + "Z" if len(t) >= 19 else t
+
+
 def tail(path, n=8):
     try:
         return "\n".join(Path(path).read_text(errors="replace").splitlines()[-n:])
@@ -138,6 +169,11 @@ def main():
     cores_csv.write("time_utc," + ",".join(f"cpu{k}" for k in sorted(ticks)) + ",temp_c\n")
     started, thr0, busy_rows, temps, last_ticks, k = time.time(), throttled(), [], [], ticks, 0
     loads = {}
+    clips, planes = Follow(out / "atc/transmissions.csv"), Follow(out / "adsb/sightings.csv")
+
+    def say(text):
+        print(("\r\033[K" if TTY else "") + text, flush=True)
+
     try:
         while any(pr.poll() is None for pr in procs.values()):
             time.sleep(1)
@@ -158,13 +194,23 @@ def main():
                     busy_rows.append(loads)
                     cores_csv.write(f"{utc(time.time())}," + ",".join(f"{loads[c]:.0f}" for c in sorted(loads))
                                     + f",{'' if t is None else t}\n")
+            for r in clips.new():
+                say(f"{clock(r.get('time_utc', ''))}  ATC    {r.get('name', ''):<11} {r.get('mhz', '')} MHz  "
+                    f"{r.get('seconds', '')} s  {r.get('peak_db', '')} dB")
+            for r in planes.new():
+                km = r.get("km_away")
+                alt = r.get("altitude_ft")
+                say(f"{clock(r.get('time_utc', ''))}  ADS-B  {r.get('icao', '')} {r.get('callsign') or '-':<8} "
+                    + (f"{alt} ft  " if alt else "") + f"{r.get('lat', '')}, {r.get('lon', '')}"
+                    + (f"  {float(km):.0f} km away" if km else ""))
             if TTY:
                 a, b = last_row(out / "atc/health.csv"), last_row(out / "adsb/health.csv")
                 line = f"  {time.time() - started:5.0f} s"
                 line += (f" | ATC stream {float(a['stream_pct']):5.1f}% rx {a['receiver_busy']}"
-                         f" clips {a['clips_waiting']}" if a else " | ATC starting")
+                         f" {clips.count} clips" if a else " | ATC starting")
                 line += (f" | ADS-B stream {float(b['stream_pct']):5.1f}% dec {b['decoder_busy']}"
-                         f" {b['msgs_per_s']} msg/s {b['aircraft_in_view']} ac" if b else " | ADS-B starting")
+                         f" {b['msgs_per_s']} msg/s {b['aircraft_in_view']} in view {planes.count} seen"
+                         if b else " | ADS-B starting")
                 if loads:
                     line += " | cores " + " ".join(f"{loads[c]:.0f}" for c in sorted(loads)) + "%"
                 if temps:
