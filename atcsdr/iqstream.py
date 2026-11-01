@@ -39,6 +39,7 @@ MAGIC = 0x31535149                   # "IQS1"
 F_PACKED12, F_TEST = 1, 2
 SLOTS = 8                            # iqstream's ring
 KERNEL_CHUNKS = 4                    # iqstream's kernel buffer, in chunks
+_CLOSED = object()                   # queued when a connection ends
 
 try:
     import numba
@@ -161,18 +162,21 @@ class PackedPluto:
 
     buffer_size is the chunk size in samples (131072 by default: about 6 ms at
     21.6 MSPS). conns = TCP connections (1-2), each from its own pinned thread
-    on the radio; cpus = iqstream's -c (reader,sender0,sender1). For tests,
+    on the radio; cpus = iqstream's -c (reader,sender0,sender1); capture =
+    "mmap" (the DMA blocks, no copy) or "read"; copy_first copies each block to
+    cached memory before packing. For tests,
     test_rate (MSPS) makes iqstream send its test pattern instead of the radio's
     samples, and local=True runs build/iqstream-native on this computer."""
 
     def __init__(self, uri, center, rate, gain="40", bandwidth=None, buffer_size=1 << 17,
                  conns=2, bits=12, cpus=None, password="analog", port=PORT,
-                 test_rate=None, local=False):
+                 test_rate=None, local=False, capture="mmap", copy_first=False):
         self.uri, self.host = uri, uri.split(":", 1)[1]
         self.center, self.rate, self.gain = center, int(rate), gain
         self.bandwidth = int(bandwidth or rate)
         self.samples, self.conns, self.bits, self.cpus = buffer_size, conns, bits, cpus
         self.password, self.port, self.test_rate, self.local = password, port, test_rate, local
+        self.capture, self.copy_first = capture, copy_first
         self.stats = dict(chunks=0, lost=0)
         self.shell = self.ctx = self._lo = self._rx_phy = self._proc = None
         self._socks, self._threads = [], []
@@ -181,7 +185,9 @@ class PackedPluto:
     # -- setup
 
     def _args(self):
-        a = f"-p {self.port} -n {self.conns} -b {self.samples} -s {SLOTS} -f {self.bits}"
+        a = f"-p {self.port} -n {self.conns} -b {self.samples} -s {SLOTS} -f {self.bits} -m {self.capture}"
+        if self.copy_first:
+            a += " -k"
         if self.cpus:
             a += f" -c {self.cpus}"
         if self.test_rate is not None:
@@ -189,7 +195,7 @@ class PackedPluto:
         return a
 
     def _open(self):
-        self._q, self._pending, self._next, self._skip_until = queue.Queue(maxsize=256), {}, 0, -1
+        self._next, self._skip_until = 0, -1
         self._stop = threading.Event()
         if self.local:
             if not NATIVE.exists():
@@ -219,12 +225,16 @@ class PackedPluto:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 << 20)
             s.settimeout(None)
             self._socks.append(s)
-        for s in self._socks:
-            t = threading.Thread(target=self._receive, args=(s,), daemon=True)
+        # One queue per connection: each connection's chunks arrive in order, so
+        # the next chunk is always at the head of one of them.
+        self._queues = [queue.Queue(maxsize=64) for _ in self._socks]
+        self._heads = [None] * len(self._socks)
+        for s, q in zip(self._socks, self._queues):
+            t = threading.Thread(target=self._receive, args=(s, q), daemon=True)
             t.start()
             self._threads.append(t)
 
-    def _receive(self, sock):
+    def _receive(self, sock, q):
         head = bytearray(HEADER.size)
         try:
             while not self._stop.is_set():
@@ -236,31 +246,17 @@ class PackedPluto:
                 payload = bytearray(samples * (3 if flags & F_PACKED12 else 4))
                 if not _recv_exact(sock, memoryview(payload)):
                     break
-                self._q.put((seq, flags, lost, t_ns, payload))
+                q.put((seq, flags, lost, t_ns, payload))
         except OSError:
             pass
-        self._q.put(None)
+        q.put(_CLOSED)
 
     # -- the Pluto interface
 
     def read(self):
         """The next chunk, in order, as interleaved int16 I/Q (12-bit values)."""
         while True:
-            item = self._pending.pop(self._next, None)
-            while item is None:
-                try:
-                    got = self._q.get(timeout=10)
-                except queue.Empty:
-                    raise OSError("no samples from iqstream for 10 s") from None
-                if got is None:
-                    raise OSError("iqstream connection closed")
-                if got[0] == self._next:
-                    item = got
-                elif got[0] > self._next:
-                    self._pending[got[0]] = got
-                    if len(self._pending) > 4 * SLOTS:
-                        raise OSError("iqstream chunks out of order beyond repair")
-            seq, flags, lost, t_ns, payload = item
+            seq, flags, lost, t_ns, payload = self._take()
             self._next += 1
             self.stats["chunks"] += 1
             self.stats["lost"] += lost
@@ -270,6 +266,34 @@ class PackedPluto:
             if flags & F_PACKED12:
                 return unpack12(payload)
             return np.frombuffer(payload, np.int16).copy()
+
+    def _take(self):
+        """The chunk numbered self._next, from whichever connection has it."""
+        heads, deadline = self._heads, time.time() + 10
+        while True:
+            for i, q in enumerate(self._queues):
+                if heads[i] is None:
+                    try:
+                        heads[i] = q.get_nowait()
+                    except queue.Empty:
+                        pass
+                if heads[i] is _CLOSED:
+                    raise OSError("iqstream connection closed")
+            for i, h in enumerate(heads):
+                if h is not None and h[0] == self._next:
+                    heads[i] = None
+                    return h
+            if all(h is not None for h in heads):    # every connection is past it: skip it
+                i = min(range(len(heads)), key=lambda j: heads[j][0])
+                h, heads[i] = heads[i], None
+                self._next = h[0]
+                return h
+            missing = next(i for i, h in enumerate(heads) if h is None)
+            try:
+                heads[missing] = self._queues[missing].get(timeout=0.05)
+            except queue.Empty:
+                if time.time() > deadline:
+                    raise OSError("no samples from iqstream for 10 s") from None
 
     def set_gain(self, gain):
         if self._rx_phy is not None:

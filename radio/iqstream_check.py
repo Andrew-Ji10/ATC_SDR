@@ -114,52 +114,70 @@ def loopback(rep, seconds):
     return ok
 
 
+def radio_log(r, *keys):
+    """iqstream's log lines containing any of `keys` (after it has stopped)."""
+    time.sleep(0.5)                                  # iqstream notices the disconnect and logs its totals
+    try:
+        return [l.replace("iqstream: ", "") for l in r.shell.text("cat /tmp/iqstream.log").splitlines()
+                if any(k in l for k in keys)]
+    except Exception:
+        return []
+
+
 def radio_test(rep, host, password, seconds, snap):
-    rep.section("2. The radio sending its test pattern flat out (packing + network, no capture)")
+    rep.section("2. The radio sending its test pattern at 21.6 MSPS (packing + network, no capture)")
     out = []
-    for conns, cpus in ((1, "0,1,0"), (2, "0,1,0")):
+    for conns in (1, 2):
         try:
-            r = IQ.PackedPluto(f"packed:{host}", 0, 21.6e6, conns=conns, cpus=cpus, test_rate=0,
-                               password=password)
+            r = IQ.PackedPluto(f"packed:{host}", 0, 21.6e6, conns=conns, test_rate=21.6, password=password)
         except OSError as e:
             rep(f"  {conns} connection(s): couldn't start: {e}")
             continue
         res = measure(r, seconds, verify=True, snap=snap)
         res.update(conns=conns)
         out.append(res)
-        rep(f"  {conns} connection(s): {res['sps'] / 1e6:5.1f} MSPS = {res['sps'] * 3 / 1e6:3.0f} MB/s; "
-            f"{res['checked']} chunks checked, {res['wrong']} wrong; radio {fmt_load(res['load'])}"
-            + (f"; error: {res['error']}" if res["error"] else ""))
+        rep(f"  {conns} connection(s): {100 * res['sps'] / 21.6e6:4.0f}% of 21.6 MSPS = "
+            f"{res['sps'] * 3 / 1e6:3.0f} MB/s; {res['checked']} chunks checked, {res['wrong']} wrong; "
+            f"radio {fmt_load(res['load'])}" + (f"; error: {res['error']}" if res["error"] else ""))
+        for line in radio_log(r, "done")[-1:]:
+            rep(f"         radio: {line}")
     return out
+
+
+# (MSPS, bits, connections, capture, copy first): what each run isolates.
+PLAN = [
+    (21_600_000, 12, 1, "mmap", False),   # zero-copy capture, packed straight from the DMA block
+    (21_600_000, 12, 1, "mmap", True),    # ... copied to cached memory first
+    (21_600_000, 12, 2, "mmap", False),   # ... two senders
+    (21_600_000, 16, 1, "mmap", False),   # 16-bit straight from the block: iiod's way, but pinned
+    (21_600_000, 12, 1, "read", False),   # the old read() capture, for comparison
+    (19_200_000, 12, 1, "mmap", False),
+    (19_200_000, 12, 2, "mmap", False),
+]
 
 
 def real(rep, host, password, seconds, snap):
     rep.section("3. The radio's real samples")
-    rep(f"  {'MSPS':>6} {'bits':>4} {'conns':>5} {'delivered':>9} {'arrived':>8} {'MB/s':>5} "
-        f"{'lost':>5}  radio cores")
+    rep(f"  {'MSPS':>5} {'bits':>4} {'conns':>5} {'capture':>12} {'delivered':>9} {'arrived':>7} "
+        f"{'MB/s':>5}  radio cores")
     out = []
-    plan = [(rate, 12, c) for rate in FULL_BAND for c in (1, 2)] + [(FULL_BAND[0], 16, 2)]
-    for rate, bits, conns in plan:
+    for rate, bits, conns, capture, copy in PLAN:
+        name = capture + (", copy" if copy else "")
         try:
-            r = IQ.PackedPluto(f"packed:{host}", 127e6, rate, conns=conns, bits=bits, password=password)
+            r = IQ.PackedPluto(f"packed:{host}", 127e6, rate, conns=conns, bits=bits, password=password,
+                               capture=capture, copy_first=copy)
         except OSError as e:
-            rep(f"  {rate / 1e6:6.1f} {bits:4d} {conns:5d}  couldn't start: {e}")
+            rep(f"  {rate / 1e6:5.1f} {bits:4d} {conns:5d} {name:>12}  couldn't start: {e}")
             continue
-        log_tail = None
         res = measure(r, seconds, snap=snap)
-        time.sleep(0.5)                              # iqstream notices the disconnect and logs its totals
-        try:
-            log_tail = [l for l in r.shell.text("cat /tmp/iqstream.log").splitlines() if "done" in l]
-        except Exception:
-            pass
-        res.update(rate=rate, bits=bits, conns=conns)
+        log = radio_log(r, "capturing with", "done", "no DMA block", "failed")
+        res.update(rate=rate, bits=bits, conns=conns, capture=name)
         out.append(res)
-        got = res["sps"] / rate
-        rep(f"  {rate / 1e6:6.1f} {bits:4d} {conns:5d} {100 * got:8.0f}% {res['sps'] / 1e6:8.1f} "
-            f"{res['sps'] * (3 if bits == 12 else 4) / 1e6:5.0f} {res['lost']:5d}  {fmt_load(res['load'])}"
-            + (f"  error: {res['error']}" if res["error"] else ""))
-        if log_tail:
-            rep(f"         radio: {log_tail[-1].replace('iqstream: ', '')}")
+        rep(f"  {rate / 1e6:5.1f} {bits:4d} {conns:5d} {name:>12} {100 * res['sps'] / rate:8.0f}% "
+            f"{res['sps'] / 1e6:7.1f} {res['sps'] * (3 if bits == 12 else 4) / 1e6:5.0f}  "
+            f"{fmt_load(res['load'])}" + (f"  error: {res['error']}" if res["error"] else ""))
+        for line in log:
+            rep(f"         radio: {line}")
     return out
 
 
@@ -177,12 +195,17 @@ def verdict(rep, ok_loop, test_runs, real_runs):
         r = best.get(rate)
         if r:
             full = r["sps"] >= 0.99 * rate and r["lost"] == 0
-            rep(f"{rate / 1e6:g} MSPS, 12-bit: {100 * r['sps'] / rate:.0f}% with {r['conns']} connection(s)"
-                + ("  -> the whole band gets through" if full else ""))
+            rep(f"{rate / 1e6:g} MSPS, 12-bit: best {100 * r['sps'] / rate:.0f}% ({r['capture']}, "
+                f"{r['conns']} connection(s))" + ("  -> the whole band gets through" if full else ""))
+    sixteen = [r for r in real_runs if r["bits"] == 16 and not r["error"]]
+    if sixteen:
+        r = sixteen[0]
+        rep(f"16-bit straight from the DMA block, pinned (iiod's way): {r['sps'] * 4 / 1e6:.0f} MB/s "
+            f"({r['sps'] / 1e6:.1f} MSPS); iiod managed 62-74 MB/s")
     if test_runs:
         top = max(test_runs, key=lambda r: r["sps"])
-        rep(f"the radio packs and sends up to {top['sps'] * 3 / 1e6:.0f} MB/s ({top['sps'] / 1e6:.1f} MSPS) "
-            f"with {top['conns']} connection(s), capture aside")
+        rep(f"test pattern (packing + sending, no capture): {100 * top['sps'] / 21.6e6:.0f}% of 21.6 MSPS "
+            f"with {top['conns']} connection(s)")
     if any(r["sps"] >= 0.99 * FULL_BAND[1] and r["lost"] == 0 for r in best.values()):
         rep("-> Use --device packed:<address> with 21.6 MSPS: one window, all 43 channels.")
     elif any(r["sps"] >= 0.99 * FULL_BAND[0] and r["lost"] == 0 for r in best.values()):
