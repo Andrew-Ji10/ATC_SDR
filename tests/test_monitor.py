@@ -9,9 +9,27 @@ import time
 import wave
 
 import numpy as np
+import pytest
 
 from atcsdr import airband as A
 from atcsdr import frequencies as fq
+
+
+def old_receiver_speed(seconds=0.5):
+    """How fast this computer runs atcsdr.airband's receiver on this test's busiest
+    window, in x real time. The test streams in real time, and the fake radio makes
+    its signal on the same computer, so it needs well over 1x (a Pi 5 manages ~1.3x;
+    the whole-band receiver there is atcsdr.fastrx, tested in test_fastrx.py)."""
+    rate, windows = A.plan(fq.area_channels("bay"), 7_680_000)
+    w = max(windows, key=lambda w: len(w.channels))
+    bank = A.FilterBank(rate, [f.mhz * 1e6 - w.center for f in w.channels])
+    chans = [A.Channel(f) for f in w.channels]
+    x = (np.random.default_rng(0).standard_normal(int(rate * seconds)) * 0.01).astype(np.complex64)
+    t, now = time.perf_counter(), time.time()
+    for block in bank.process(x):
+        for ch, y in zip(chans, block):
+            ch.process(y, now, now)
+    return seconds / (time.perf_counter() - t)
 
 
 class FakePluto:
@@ -51,6 +69,10 @@ class FakePluto:
 
 
 def test_bay_survey_with_window_rotation(tmp_path, monkeypatch):
+    speed = old_receiver_speed()
+    if speed < 2.0:
+        pytest.skip(f"this computer runs the old receiver at {speed:.1f}x real time; "
+                    "this real-time test needs 2x or more")
     talkers = {120.5: (1.0, 2.0),      # SFO Twr, window 1
                128.325: (0.5, 2.5),    # SFO Arr E, window 2
                134.5: (2.0, 1.5)}      # App East 2, window 3
