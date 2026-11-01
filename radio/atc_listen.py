@@ -253,8 +253,9 @@ def main():
             last.update(received=stats["received"], dropped=stats["dropped"], busy=stats["busy"], lost=lost, t=now)
             if TTY:
                 talking = [sq.name for sq in rx.squelches if sq.open]
+                up = f"{100 * up_seconds[0] / seconds[0]:5.1f}%" if seconds[0] else "starting"
                 print(f"\r\033[K  {seconds[0]:5d} s  stream {100 * got:5.1f}%  receiver {busy:4.2f}  "
-                      f"up {100 * up_seconds[0] / seconds[0]:5.1f}%  clips waiting {waiting}  "
+                      f"up {up}  clips waiting {waiting}  "
                       + (f"{t:.0f} C  " if t else "") + (", ".join(talking[:4]) or "quiet"), end="", flush=True)
 
     started, thr0 = time.time(), throttled()
