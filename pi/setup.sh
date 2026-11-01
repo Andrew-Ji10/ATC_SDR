@@ -17,12 +17,17 @@
 #   2. with --eth-ip: a static address on the Pi's Ethernet port (NetworkManager),
 #      for a direct cable; internet keeps going over Wi-Fi
 #   3. a udev rule so a Pluto on USB works without sudo (for configuring it)
-#   4. a virtualenv in .venv (with the system numpy/scipy) holding noisereduce and numba
-#   5. checks: Python modules, lame, the Pluto reachable, and that it tunes airband
+#   4. ADS-B on an RTL-SDR: rtl-sdr tools, the DVB-T kernel driver blacklisted (it
+#      grabs the dongle otherwise), and your user in plugdev (USB access)
+#   5. a virtualenv in .venv (with the system numpy/scipy) holding noisereduce,
+#      numba and pyModeS (ADS-B decoding)
+#   6. checks: Python modules, lame, the Pluto reachable, that it tunes airband,
+#      and the RTL-SDR (if one is plugged in)
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 RULE=/etc/udev/rules.d/53-adi-plutosdr-usb.rules
+RTL_BLACKLIST=/etc/modprobe.d/blacklist-rtl-sdr.conf
 CHECK_ONLY=0
 PLUTO_GIVEN=0
 ETH_IP=""
@@ -61,7 +66,7 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
     $SUDO apt-get update -q
     $SUDO apt-get install -y -q python3 python3-venv python3-pip python3-numpy \
         python3-scipy python3-matplotlib python3-tqdm python3-joblib \
-        libiio-utils lame usbutils iputils-ping
+        libiio-utils lame usbutils iputils-ping rtl-sdr sshpass
     # The libiio Python bindings: from apt if this release packages them, else pip.
     if apt-cache show python3-libiio >/dev/null 2>&1; then
         $SUDO apt-get install -y -q python3-libiio
@@ -110,13 +115,41 @@ EOF
     $SUDO udevadm trigger --subsystem-match=usb --attr-match=idVendor=0456 || true
     ok "$RULE"
 
+    say "RTL-SDR for ADS-B"
+    # The kernel's DVB-T TV driver claims RTL2832U dongles, and then rtl_sdr can't open them.
+    if ! grep -rqs dvb_usb_rtl28xxu /etc/modprobe.d/; then
+        $SUDO tee "$RTL_BLACKLIST" >/dev/null <<'EOF'
+# RTL-SDR dongles: keep the DVB-T TV driver off them (written by ATC_SDR pi/setup.sh)
+blacklist dvb_usb_rtl28xxu
+blacklist rtl2832_sdr
+blacklist rtl2832
+blacklist rtl2830
+EOF
+        ok "blacklisted the DVB-T driver ($RTL_BLACKLIST)"
+    else
+        ok "DVB-T driver already blacklisted"
+    fi
+    if lsmod | grep -q '^dvb_usb_rtl28xxu'; then
+        $SUDO modprobe -r dvb_usb_rtl28xxu rtl2832_sdr rtl2832 2>/dev/null \
+            && ok "unloaded the DVB-T driver" \
+            || warn "couldn't unload the DVB-T driver: unplug and replug the RTL-SDR (or reboot)"
+    fi
+    # The rtl-sdr package's udev rule gives the plugdev group access to the dongle.
+    WHO="${SUDO_USER:-$(id -un)}"
+    if id -nG "$WHO" | grep -qw plugdev; then
+        ok "$WHO is in plugdev (USB access to the dongle)"
+    else
+        $SUDO usermod -aG plugdev "$WHO"
+        warn "added $WHO to plugdev: log out and back in (or reboot) for it to apply"
+    fi
+
     say "Python environment ($VENV)"
     [ -x "$PY" ] || python3 -m venv --system-site-packages "$VENV"
     "$PY" -m pip install -q --upgrade pip
+    # numba: compiled, multi-core DSP (radio/dsp_bench.py). pyModeS: ADS-B decoding.
     # shellcheck disable=SC2086
-    # numba: compiled, multi-core DSP (radio/dsp_bench.py).
-    "$PY" -m pip install -q noisereduce numba $PIP_IIO
-    ok "noisereduce, numba${PIP_IIO:+, $PIP_IIO} installed"
+    "$PY" -m pip install -q noisereduce numba "pyModeS>=3" $PIP_IIO
+    ok "noisereduce, numba, pyModeS${PIP_IIO:+, $PIP_IIO} installed"
 
     mkdir -p "$ROOT/recordings/logs"
     chmod +x "$ROOT/pi/"*.sh "$ROOT/radio/"*.py 2>/dev/null || true
@@ -130,11 +163,32 @@ fi
 say "Checks"
 if [ -x "$PY" ]; then ok "virtualenv: $("$PY" --version)"; else bad "no $VENV: run bash pi/setup.sh"; PY=python3; fi
 
-for mod in numpy scipy iio noisereduce numba; do
+for mod in numpy scipy iio noisereduce numba pyModeS; do
     if "$PY" -c "import $mod" 2>/dev/null; then ok "python module $mod"; else bad "python module $mod missing"; fi
 done
 if command -v lame >/dev/null; then ok "lame (MP3 clips)"; else warn "lame missing: clips will be WAV only"; fi
 if command -v iio_info >/dev/null; then ok "iio_info"; else bad "iio_info missing (apt install libiio-utils)"; fi
+
+# The RTL-SDR (ADS-B): optional, so a missing dongle is only a warning.
+if ! command -v rtl_test >/dev/null; then
+    bad "rtl-sdr tools missing (apt install rtl-sdr)"
+elif ! lsusb 2>/dev/null | grep -qiE '0bda:283[28]'; then
+    warn "no RTL-SDR plugged in (needed for ADS-B)"
+else
+    ok "RTL-SDR on USB: $(lsusb | grep -iE '0bda:283[28]' | head -1 | cut -d' ' -f6-)"
+    RTL_OUT="$(timeout 5 rtl_test -t 2>&1 || true)"
+    if echo "$RTL_OUT" | grep -q "Kernel driver is active"; then
+        bad "the DVB-T driver holds the RTL-SDR: unplug and replug it, or reboot"
+    elif echo "$RTL_OUT" | grep -qiE "usb_open error|Failed to open"; then
+        bad "can't open the RTL-SDR (permissions? log out and back in after setup; or it's in use)"
+        echo "$RTL_OUT" | grep -iE "error|failed" | head -3 | sed 's/^/          /'
+    elif echo "$RTL_OUT" | grep -q "Found [1-9]"; then
+        ok "rtl_test opens it: $(echo "$RTL_OUT" | grep -m1 -iE 'tuner' || echo 'tuner ok')"
+    else
+        warn "rtl_test gave no clear answer:"
+        echo "$RTL_OUT" | head -5 | sed 's/^/          /'
+    fi
+fi
 
 case "$PLUTO" in
     ip:*)
@@ -204,6 +258,10 @@ if [ "$FAILED" -eq 0 ]; then
   To see whether the link to the Pluto ever drops, leave this running (e.g. overnight):
 
     pi/linktest.sh 8h
+
+  To find out why the whole band (21.6 MSPS) doesn't fit through the link:
+
+    pi/linkdiag.sh
 
   Then record, by hand or on a schedule with cron (crontab -e), e.g. 07:00-09:00:
 

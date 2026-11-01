@@ -14,6 +14,7 @@ Tools for listening to, recording and decoding Bay Area air traffic with an ADAL
 | [radio/bay_all.py](radio/bay_all.py) | Surveys all 43 Bay Area channels to see what you can pick up |
 | [radio/record.py](radio/record.py), [pi/record.sh](pi/record.sh) | Records any channel set for a set time, unattended (e.g. on a Raspberry Pi) |
 | [radio/linkwatch.py](radio/linkwatch.py), [pi/linktest.sh](pi/linktest.sh) | Watches the Pi-Pluto link for hours and logs every drop, stall and reconnect |
+| [radio/link_diag.py](radio/link_diag.py), [pi/linkdiag.sh](pi/linkdiag.sh) | Finds why the Pluto can't stream 21.6 MSPS: radio capture, network stack or iiod |
 | [radio/dsp_bench.py](radio/dsp_bench.py), [pi/dspbench.sh](pi/dspbench.sh) | Benchmarks the DSP for the whole band in one window (21.6 MSPS), single- and multi-core |
 | [radio/characterize.py](radio/characterize.py), [pi/characterize.sh](pi/characterize.sh) | Measures CPU, link and RF (gain sweep, interference), and recommends `--max-rate` / `--gain` |
 | [radio/multi_atc.py](radio/multi_atc.py) | Plays any set of channels live, in stereo |
@@ -37,7 +38,7 @@ atcsdr/            shared library used by every script
   gr_receiver.py     GNU Radio single-channel receiver (used by listen.py, gui.py, capture_clips.py)
 radio/             airband scripts (listed above)
 adsb/              ADS-B scripts (listed above)
-pi/                Raspberry Pi: setup.sh (install, checks), characterize.sh, linktest.sh, dspbench.sh, record.sh
+pi/                Raspberry Pi: setup.sh (install, checks), characterize.sh, linktest.sh, linkdiag.sh, dspbench.sh, record.sh
 samples/adsb/      a recorded ADS-B session: tracks, maps, animations
 tests/             pytest suite on synthetic signals (no hardware needed)
 recordings/        where recordings go (not tracked by git)
@@ -134,6 +135,28 @@ gives the counts, the total and longest outage, and the round-trip times.
 `recordings/linktest_<time>/` holds `events.csv`, `summary.txt` and `link.csv` (one
 row per second: ping, link and the % of samples received), for plotting. The recorder
 reconnects by itself after a drop; this test tells you how often that would happen.
+
+#### Link diagnosis: why doesn't the whole band fit through?
+
+```sh
+pi/linkdiag.sh                  # about 2 minutes; --rates 10.8 16.8 21.6, --seconds 8, --password
+```
+
+The whole band in one window is 21.6 MSPS, or 86 MB/s non-stop. The radio digitizes that
+easily, but streaming it over Ethernet has fallen short (about 16 MSPS measured). This
+runs three tests to find the bottleneck, reading the radio's CPU load over SSH as root
+(default password `analog`) during each:
+
+- **A.** Capture on the radio itself, with no network (`iio_readdev` to `/dev/null`): the
+  chip, FPGA, DMA and RAM path.
+- **B.** Plain TCP from the radio to the Pi (`dd /dev/zero | nc`), without `iiod`: the
+  radio's CPU, TCP/IP stack and Ethernet.
+- **C.** The normal libiio stream at several rates and buffer sizes: the whole path,
+  including `iiod`, with `iiod`'s share of a radio core.
+
+The verdict says which part is the limit and what would fix it: buffer settings, a
+newer `iiod`, a custom streaming program on the radio (12-bit samples need 65 MB/s), or
+processing on the radio's FPGA.
 
 #### DSP benchmark: the whole band in one window?
 

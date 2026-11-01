@@ -262,8 +262,14 @@ def main():
         lines.append(f"         {len(stalls)} stall(s)" + (f", longest {max(stalls):.2f} s" if stalls else "")
                      + f"; {short} second(s) below {SHORT_PCT}% of the rate")
     drops = len(outages) + link_drops + stats["errors"]
-    lines.append("Verdict: " + ("no drops." if drops == 0 and not stats["stalls"] else
-                                f"{drops} drop(s) in {span(elapsed)}; the times are in events.csv."))
+    verdict = ("no drops" if drops == 0 and not stats["stalls"] else
+               f"{drops} drop(s) in {span(elapsed)}; the times are in events.csv")
+    if rate:
+        got = stats["samples"] / (rate * elapsed)
+        if got < 0.99:
+            verdict += (f"; but the link can't sustain {rate / 1e6:g} MSPS: it delivered "
+                        f"{100 * got:.0f}%, about {got * rate / 1e6:.1f} MSPS")
+    lines.append(f"Verdict: {verdict}.")
     report = "\n".join(lines)
     print("\n\n" + report)
     (out / "summary.txt").write_text(report + "\n")
