@@ -38,7 +38,7 @@ USB_NETWORK = "ip:192.168.2."   # the Pluto's network-over-USB address: still a 
 FALLBACK_URI = "ip:192.168.2.1"
 
 
-PACKED_MAX_RATE = 21_600_000  # packed:<address>, 12-bit via iqstream: the whole band (to be measured)
+PACKED_MAX_RATE = 21_600_000  # packed:<address>, via iqstream: the whole band, measured in full
 
 
 def is_packed(uri):

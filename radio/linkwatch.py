@@ -102,7 +102,8 @@ class Log:
 
 def stream(uri, rate, center, gain, stats, log, stop):
     """Read the Pluto flat out; reopen it whenever it fails, and log what happened."""
-    buf = max(1 << 14, int(rate * 0.05))                 # ~50 ms per read
+    # ~50 ms per read; iqstream (packed:) uses its own measured-best block size.
+    buf = (1 << 19) if pluto.is_packed(uri) else max(1 << 14, int(rate * 0.05))
     stall_s = max(0.5, 4 * buf / rate)
     radio, down_since, last = None, None, None
     while not stop.is_set():

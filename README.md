@@ -174,8 +174,9 @@ processing on the radio's FPGA.
 scheduler picks. Sometimes that's the core handling the Ethernet interrupts, and then it
 tops out near 62 MB/s (15.5 MSPS). `iqstream` ([radio/iqstream/iqstream.c](radio/iqstream/iqstream.c))
 maps the radio's DMA blocks and sends them straight from the block, from a thread pinned
-to the other core. That measured **81 MB/s (20.3 MSPS)** at 21.6 MSPS, enough for the
-whole band at 19.2 MSPS. It can also pack the 12-bit samples into 3 bytes (`-f 12`), but
+to the other core, in 524288-sample blocks with a 4 MB socket send buffer. That carries
+**21.6 MSPS in full (87 MB/s)**: the whole band, all 43 channels, in one window. It can
+also pack the 12-bit samples into 3 bytes (`-f 12`), but
 on the radio's ARM, packing costs more than it saves, so it sends 16-bit by default. It
 runs from the radio's RAM (`/tmp`), so nothing is written to its flash and a reboot
 removes it. Tuning, gain and sample rate still go through `iiod`.

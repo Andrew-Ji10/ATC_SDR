@@ -3,8 +3,10 @@
 iiod lands on whichever radio core the scheduler picks, sometimes the one that
 handles the Ethernet interrupts, and then tops out near 62 MB/s (15.5 MSPS).
 iqstream (C, in radio/iqstream/) runs on the radio from RAM, maps the DMA
-blocks and sends them, straight from the block, from threads pinned away from
-the interrupts: 81 MB/s (20.3 MSPS) measured with 1 connection, 16-bit.
+blocks and sends them, straight from the block, from a thread pinned away
+from the interrupts. Measured: 21.6 MSPS in full (87 MB/s, the sender at 75% of
+a core) with 1 connection, 524288-sample blocks and a 4 MB send buffer, the
+defaults here; iiod managed 62-74 MB/s.
 It can also pack to 12 bits (-f 12), but packing costs the radio's ARM more
 than the bytes it saves, so 16-bit is the default.
 
@@ -162,8 +164,8 @@ def _recv_exact(sock, view):
 class PackedPluto:
     """The Pluto's RX1 through iqstream: int16 I/Q from read(), like atcsdr.pluto.Pluto.
 
-    buffer_size is the chunk size in samples (131072 by default: about 6 ms at
-    21.6 MSPS). conns = TCP connections (1-2), each from its own pinned thread
+    buffer_size is the DMA block / chunk size in samples (524288 by default:
+    about 24 ms at 21.6 MSPS). conns = TCP connections (1-2), each from its own pinned thread
     on the radio; cpus = iqstream's -c (reader,sender0,sender1); capture =
     "mmap" (the DMA blocks, no copy) or "read"; copy_first copies each block to
     cached memory before packing; sndbuf sets the radio's socket send buffer
@@ -171,9 +173,9 @@ class PackedPluto:
     test_rate (MSPS) makes iqstream send its test pattern instead of the radio's
     samples, and local=True runs build/iqstream-native on this computer."""
 
-    def __init__(self, uri, center, rate, gain="40", bandwidth=None, buffer_size=1 << 17,
+    def __init__(self, uri, center, rate, gain="40", bandwidth=None, buffer_size=1 << 19,
                  conns=1, bits=16, cpus=None, password="analog", port=PORT,
-                 test_rate=None, local=False, capture="mmap", copy_first=False, sndbuf=0):
+                 test_rate=None, local=False, capture="mmap", copy_first=False, sndbuf=4 << 20):
         self.uri, self.host = uri, uri.split(":", 1)[1]
         self.center, self.rate, self.gain = center, int(rate), gain
         self.bandwidth = int(bandwidth or rate)
