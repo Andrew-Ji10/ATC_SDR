@@ -343,10 +343,90 @@ def test_stream(rep, radio, uri, rates, seconds):
     return results
 
 
+# ------------------------------------------------------------------ D
+
+def test_steering(rep, radio, uri, buffer, kbufs, seconds):
+    """The network stack's interrupt work and iiod both default to core 0: try them
+    on separate cores. Settings are put back afterwards (and reset on reboot anyway)."""
+    rep.section(f"D. Spreading the work over both radio cores ({TARGET / 1e6:g} MSPS, "
+                f"buffer {buffer} x {kbufs})")
+    irqs = [line.split(":")[0].strip() for line in
+            radio.run("grep -iE 'eth0|ethernet' /proc/interrupts").stdout.splitlines() if ":" in line]
+    pids = radio.run("pidof iiod").stdout.split()
+    if not irqs or not pids:
+        rep(f"  couldn't find the Ethernet interrupt ({irqs}) or iiod ({pids}): skipped")
+        return []
+    pid = pids[0]
+    taskset = has_applet(radio, "taskset")
+    rps = "/sys/class/net/eth0/queues/rx-0/rps_cpus"
+    orig = {f"/proc/irq/{n}/smp_affinity": radio.run(f"cat /proc/irq/{n}/smp_affinity").stdout.strip()
+            for n in irqs}
+    orig_rps = radio.run(f"cat {rps} 2>/dev/null").stdout.strip()
+    m = radio.run(f"taskset -p {pid} 2>/dev/null").stdout.strip().split(":")
+    orig_task = m[-1].strip() if taskset and len(m) > 1 else None
+    rep(f"  Ethernet interrupt(s) {', '.join(irqs)} on cores mask {', '.join(orig.values())}; "
+        f"iiod pid {pid}" + (f", cores mask {orig_task}" if orig_task else
+                             " (no taskset on the radio: only the interrupts can be moved)"))
+
+    def place(net, iiod):
+        errs = []
+        for path in orig:
+            if radio.run(f"echo {net} > {path}").returncode:
+                errs.append(path)
+        if orig_rps:
+            radio.run(f"echo {net} > {rps}")
+        if iiod and taskset:
+            radio.run(f"taskset -p {iiod} {pid}")
+        return errs
+
+    results = []
+    configs = [("as is", None, None),
+               ("network on core 1, iiod on core 0", "2", "1"),
+               ("network on core 0, iiod on core 1", "1", "2")]
+    try:
+        for name, net, iiod in configs:
+            if net:
+                errs = place(net, iiod)
+                if errs:
+                    rep(f"  {name}: couldn't set {', '.join(errs)}")
+                    continue
+            res = stream(uri, TARGET, buffer, kbufs, seconds, radio)
+            if "got" not in res:
+                rep(f"  {name}: couldn't open the stream ({res.get('error', '')[:60]})")
+                continue
+            res.update(name=name, rate=TARGET, buffer=buffer, kbufs=kbufs)
+            results.append(res)
+            cores = ", ".join(f"{k} {v:.0f}%" for k, v in sorted(res["busy"].items()))
+            rep(f"  {name:<36} {100 * res['got']:4.0f}% delivered, "
+                f"{res['got'] * TARGET * BYTES_PER_SAMPLE / 1e6:3.0f} MB/s; iiod {res['iiod']:3.0f}%; {cores}")
+    finally:
+        for path, mask in orig.items():
+            radio.run(f"echo {mask} > {path}")
+        if orig_rps:
+            radio.run(f"echo {orig_rps} > {rps}")
+        if orig_task:
+            radio.run(f"taskset -p {orig_task} {pid}")
+        rep("  (original placement restored)")
+    return results
+
+
 # ------------------------------------------------------------------ verdict
 
-def verdict(rep, capture, tcp, results):
+def verdict(rep, capture, tcp, results, steered=()):
     rep.section("Verdict")
+    as_is = next((r for r in steered if r["name"] == "as is"), None)
+    moved = max((r for r in steered if r["name"] != "as is"), key=lambda r: r["got"], default=None)
+    if as_is and moved:
+        gain = moved["got"] - as_is["got"]
+        rep(f"spreading over both cores ({moved['name']}): {100 * as_is['got']:.0f}% -> "
+            f"{100 * moved['got']:.0f}% delivered"
+            + ("  (helps)" if gain > 0.03 else "  (no real change)"))
+    plain = [r for r in results if r["rate"] == TARGET]      # test C only, for the buffer comparison
+    results = list(results) + [r for r in steered if r["name"] != "as is"]
+    near = [r for r in results if abs(r["rate"] - 19_200_000) < 1 and r["got"] >= 0.99]
+    if near:
+        rep("19.2 MSPS gets through in full: the whole band fits at 19.2 if the outer channels may sit "
+            "nearer the band edges (to check with characterize.sh).")
     need = TARGET * BYTES_PER_SAMPLE / 1e6
     at_target = [r for r in results if r["rate"] == TARGET]
     best = max(at_target, key=lambda r: r["got"], default=None)
@@ -403,11 +483,12 @@ def verdict(rep, capture, tcp, results):
         if busy and max(busy.values()) > 90:
             rep(f"   During the {TARGET / 1e6:g} MSPS stream a radio core was {max(busy.values()):.0f}% busy: "
                 "the radio's CPU is saturated.")
-        default = next((r for r in at_target if (r["buffer"], r["kbufs"]) == DEFAULT_BUFFER), None)
-        if default and best is not default and best["got"] - default["got"] > 0.03:
+        default = next((r for r in plain if (r["buffer"], r["kbufs"]) == DEFAULT_BUFFER), None)
+        best_buf = max(plain, key=lambda r: r["got"], default=None)
+        if default and best_buf and best_buf is not default and best_buf["got"] - default["got"] > 0.03:
             rep(f"   Buffer size matters: {100 * default['got']:.0f}% with the recorder's "
-                f"{default['buffer']} samples x {default['kbufs']}, {100 * best['got']:.0f}% with "
-                f"{best['buffer']} x {best['kbufs']}: the recorder should use the latter.")
+                f"{default['buffer']} samples x {default['kbufs']}, {100 * best_buf['got']:.0f}% with "
+                f"{best_buf['buffer']} x {best_buf['kbufs']}: the recorder should use the latter.")
 
 
 def main():
@@ -415,8 +496,9 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--device", default="", help="Pluto URI, e.g. ip:192.168.3.2")
     p.add_argument("--password", default="analog", help="the radio's root password (default analog)")
-    p.add_argument("--rates", type=float, nargs="+", default=[10.8, 14.4, 18.0, 21.6],
-                   help="MSPS to stream in test C (default 10.8 14.4 18.0 21.6)")
+    p.add_argument("--rates", type=float, nargs="+", default=[10.8, 14.4, 18.0, 19.2, 21.6],
+                   help="MSPS to stream in test C (default 10.8 14.4 18.0 19.2 21.6)")
+    p.add_argument("--no-steering", action="store_true", help="skip test D")
     p.add_argument("--seconds", type=float, default=6.0, help="seconds per measurement (default 6)")
     p.add_argument("--out", help="output folder (default recordings/linkdiag_<time>)")
     args = p.parse_args()
@@ -441,7 +523,12 @@ def main():
     tcp = test_tcp(rep, radio, args.seconds)
     rates = sorted({int(r * 1e6) for r in args.rates} | {TARGET})
     results = test_stream(rep, radio, uri, rates, args.seconds)
-    verdict(rep, capture, tcp, results)
+    steered = []
+    at_target = [r for r in results if r["rate"] == TARGET]
+    if at_target and not args.no_steering:
+        b = max(at_target, key=lambda r: r["got"])
+        steered = test_steering(rep, radio, uri, b["buffer"], b["kbufs"], args.seconds)
+    verdict(rep, capture, tcp, results, steered)
 
     out = Path(args.out or ROOT / f"recordings/linkdiag_{datetime.now():%Y%m%d-%H%M%S}")
     out.mkdir(parents=True, exist_ok=True)

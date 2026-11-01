@@ -153,6 +153,10 @@ runs three tests to find the bottleneck, reading the radio's CPU load over SSH a
   radio's CPU, TCP/IP stack and Ethernet.
 - **C.** The normal libiio stream at several rates and buffer sizes: the whole path,
   including `iiod`, with `iiod`'s share of a radio core.
+- **D.** The same stream with the work spread over the radio's two cores: the Ethernet
+  interrupts on one core and `iiod` on the other, both ways round. The original
+  placement is put back afterwards, and it resets on reboot anyway. Skip it with
+  `--no-steering`.
 
 The verdict says which part is the limit and what would fix it: buffer settings, a
 newer `iiod`, a custom streaming program on the radio (12-bit samples need 65 MB/s), or
