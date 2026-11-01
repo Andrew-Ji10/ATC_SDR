@@ -14,6 +14,7 @@ Tools for listening to, recording and decoding Bay Area air traffic with an ADAL
 | [radio/bay_all.py](radio/bay_all.py) | Surveys all 43 Bay Area channels to see what you can pick up |
 | [radio/record.py](radio/record.py), [pi/record.sh](pi/record.sh) | Records any channel set for a set time, unattended (e.g. on a Raspberry Pi) |
 | [radio/linkwatch.py](radio/linkwatch.py), [pi/linktest.sh](pi/linktest.sh) | Watches the Pi-Pluto link for hours and logs every drop, stall and reconnect |
+| [radio/demo_video.py](radio/demo_video.py) | Demonstration video of a station test: ADS-B tracks on a map, ATC audio on the soundtrack |
 | [pi/full_test.sh](pi/full_test.sh) | The whole check in order: setup, tests, build, the Pi alone, then the real station test; one report |
 | [radio/station_test.py](radio/station_test.py), [pi/station_test.sh](pi/station_test.sh) | ATC and ADS-B together on the planned core layout: uptime of each, per-core load, storage |
 | [radio/adsb_listen.py](radio/adsb_listen.py), [pi/adsb_listen.sh](pi/adsb_listen.sh) | ADS-B from the RTL-SDR for a set time: messages, tracks, health log, uptime |
@@ -248,6 +249,28 @@ system's uptime, every core's average and peak load, temperature and throttling,
 storage for both. Each test's own files are in `atc/` and `adsb/`, and `cores.csv` logs the
 cores every 5 s. With `--atc-source synthetic --adsb-source synthetic` it runs with no
 radios at all, doing the same work, to check the Pi on its own.
+
+#### Demonstration video: ADS-B tracks with the ATC audio
+
+```sh
+python3 radio/demo_video.py recordings/<run>/station --ref 37.43 -122.17     # -> <run>/station/demo.mp4
+python3 radio/demo_video.py <station dir> --preview 60 --size 1280x720       # a quick look first
+```
+
+This replays a station test as a video. The aircraft move across an OpenStreetMap map
+(arrows coloured by altitude, with fading trails, callsigns and altitudes), and each ATC
+transmission plays on the soundtrack at the moment it was heard, using the cleaned clips
+(`--plain` for the others). While a channel talks:
+
+- its frequency and name are shown,
+- its airport pulses on the map (SFO for SFO Tower, SQL for SQL App...),
+- it joins a list of recent transmissions.
+
+The NorCal sectors that don't belong to one airport get the caption only. The UTC clock
+shows real time while anyone talks, and fast-forwards 10x (`--ff`) in between, so speech is
+never sped up. A 20-minute run becomes about 9 minutes of 1080p video, rendered in a few
+minutes on a desktop. It needs `ffmpeg` and, once, internet access for the map tiles, which
+are cached in `recordings/tile_cache/`.
 
 #### iqstream: a faster streamer than iiod
 
