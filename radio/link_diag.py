@@ -287,7 +287,7 @@ def test_tcp(rep, radio, seconds):
     rep(f"  {mbps:.0f} MB/s ({mbps * 8:.0f} Mb/s) = {mbps / BYTES_PER_SAMPLE:.1f} MSPS worth of "
         f"16-bit samples; {TARGET / 1e6:g} MSPS needs {TARGET * BYTES_PER_SAMPLE / 1e6:.0f} MB/s")
     rep(f"  {fmt_load(busy)}; this computer {pi_cpu:.0f}% of one core")
-    return mbps
+    return dict(mbps=mbps, busy=busy)
 
 
 # ------------------------------------------------------------------ C
@@ -360,11 +360,11 @@ def test_stream(rep, radio, uri, rates, seconds):
 
 # ------------------------------------------------------------------ D
 
-def test_steering(rep, radio, uri, buffer, kbufs, seconds):
+def test_steering(rep, radio, uri, rates, buffer, kbufs, seconds):
     """The network stack's interrupt work and iiod both default to core 0: try them
     on separate cores. Settings are put back afterwards (and reset on reboot anyway)."""
-    rep.section(f"D. Spreading the work over both radio cores ({TARGET / 1e6:g} MSPS, "
-                f"buffer {buffer} x {kbufs})")
+    rep.section(f"D. Spreading the work over both radio cores "
+                f"({', '.join(f'{r / 1e6:g}' for r in rates)} MSPS, buffer {buffer} x {kbufs})")
     irqs = [line.split(":")[0].strip() for line in
             radio.run("grep -iE 'eth0|ethernet' /proc/interrupts").stdout.splitlines() if ":" in line]
     pids = radio.run("pidof iiod").stdout.split()
@@ -405,15 +405,17 @@ def test_steering(rep, radio, uri, buffer, kbufs, seconds):
                 if errs:
                     rep(f"  {name}: couldn't set {', '.join(errs)}")
                     continue
-            res = stream(uri, TARGET, buffer, kbufs, seconds, radio)
-            if "got" not in res:
-                rep(f"  {name}: couldn't open the stream ({res.get('error', '')[:60]})")
-                continue
-            res.update(name=name, rate=TARGET, buffer=buffer, kbufs=kbufs)
-            results.append(res)
-            cores = ", ".join(f"{k} {v:.0f}%" for k, v in sorted(res["busy"].items()))
-            rep(f"  {name:<36} {100 * res['got']:4.0f}% delivered, "
-                f"{res['got'] * TARGET * BYTES_PER_SAMPLE / 1e6:3.0f} MB/s; iiod {res['iiod']:3.0f}%; {cores}")
+            for rate in rates:
+                res = stream(uri, rate, buffer, kbufs, seconds, radio)
+                if "got" not in res:
+                    rep(f"  {name}: couldn't open the stream ({res.get('error', '')[:60]})")
+                    continue
+                res.update(name=name, rate=rate, buffer=buffer, kbufs=kbufs)
+                results.append(res)
+                cores = ", ".join(f"{k} {v:.0f}%" for k, v in sorted(res["busy"].items()))
+                rep(f"  {rate / 1e6:5.1f} MSPS  {name:<34} {100 * res['got']:4.0f}% delivered, "
+                    f"{res['got'] * rate / 1e6:4.1f} MSPS arrived, "
+                    f"{res['got'] * rate * BYTES_PER_SAMPLE / 1e6:3.0f} MB/s; iiod {res['iiod']:3.0f}%; {cores}")
     finally:
         for path, mask in orig.items():
             radio.run(f"echo {mask} > {path}")
@@ -429,13 +431,15 @@ def test_steering(rep, radio, uri, buffer, kbufs, seconds):
 
 def verdict(rep, capture, tcp, results, steered=()):
     rep.section("Verdict")
-    as_is = next((r for r in steered if r["name"] == "as is"), None)
-    moved = max((r for r in steered if r["name"] != "as is"), key=lambda r: r["got"], default=None)
-    if as_is and moved:
-        gain = moved["got"] - as_is["got"]
-        rep(f"spreading over both cores ({moved['name']}): {100 * as_is['got']:.0f}% -> "
-            f"{100 * moved['got']:.0f}% delivered"
-            + ("  (helps)" if gain > 0.03 else "  (no real change)"))
+    for rate in sorted({r["rate"] for r in steered}):
+        as_is = next((r for r in steered if r["name"] == "as is" and r["rate"] == rate), None)
+        moved = max((r for r in steered if r["name"] != "as is" and r["rate"] == rate),
+                    key=lambda r: r["got"], default=None)
+        if as_is and moved:
+            gain = moved["got"] - as_is["got"]
+            rep(f"{rate / 1e6:g} MSPS, spreading over both cores ({moved['name']}): "
+                f"{100 * as_is['got']:.0f}% -> {100 * moved['got']:.0f}% delivered"
+                + ("  (helps)" if gain > 0.03 else "  (no real change)"))
     plain = [r for r in results if r["rate"] == TARGET]      # test C only, for the buffer comparison
     results = list(results) + [r for r in steered if r["name"] != "as is"]
     near = [r for r in results if abs(r["rate"] - 19_200_000) < 1 and r["got"] >= 0.99]
@@ -464,17 +468,27 @@ def verdict(rep, capture, tcp, results, steered=()):
         return
     if best and any(r["pi"] > 85 for r in at_target):
         rep("-> This computer's reading loop is near 100% of a core: the Pi side is (also) a limit.")
+    peak = max((r["got"] * r["rate"] * BYTES_PER_SAMPLE / 1e6 for r in results), default=0)
     if tcp is not None:
-        if tcp < need:
-            packed = TARGET * 3 / 1e6                 # 12-bit I + 12-bit Q = 3 bytes a sample
-            rep(f"-> Plain TCP from the radio tops out at {tcp:.0f} MB/s, below the {need:.0f} MB/s needed, "
-                "even without iiod: the radio's CPU / network stack is the limit, not iiod.")
-            rep(f"   12-bit packing needs {packed:.0f} MB/s: "
-                + ("that would fit (it needs a custom streaming program on the radio)."
-                   if tcp > packed * 1.05 else "still too much; only processing on the radio's FPGA "
-                   "(sending just the channels) gets the whole band through."))
+        tcp_core = max(tcp["busy"].values(), default=0)
+        if tcp["mbps"] < need:
+            if tcp_core >= 75:
+                rep(f"-> Plain TCP without iiod also stops at {tcp['mbps']:.0f} MB/s, with one radio core "
+                    f"{tcp_core:.0f}% busy: that's one sending thread's worth, and iiod hits the same wall "
+                    f"when its work piles onto one core. The best seen with the work spread over both "
+                    f"cores: {peak:.0f} MB/s. The limit is how much one radio core can send.")
+            else:
+                rep(f"-> Plain TCP from the radio tops out at {tcp['mbps']:.0f} MB/s, below the {need:.0f} MB/s "
+                    "needed, without either core saturated: the radio's network path is the limit.")
+            best_seen = max(peak, tcp["mbps"])
+            for msps in (19.2, 21.6):
+                packed = msps * 3                     # 12-bit I + 12-bit Q = 3 bytes a sample
+                rep(f"   12-bit samples at {msps:g} MSPS need {packed:.0f} MB/s: "
+                    + (f"within the {best_seen:.0f} MB/s already seen" if best_seen > packed * 1.05 else
+                       f"more than the {best_seen:.0f} MB/s seen so far")
+                    + " (needs a custom streaming program on the radio).")
         else:
-            rep(f"-> Plain TCP from the radio reaches {tcp:.0f} MB/s, more than the {need:.0f} MB/s needed, "
+            rep(f"-> Plain TCP from the radio reaches {tcp['mbps']:.0f} MB/s, more than the {need:.0f} MB/s needed, "
                 "but the libiio stream doesn't: iiod itself is the bottleneck"
                 + (f" (it uses {best['iiod']:.0f}% of a radio core)" if best else "") + ".")
             rep("   Fixes, easiest first: a newer libiio/iiod on the radio (firmware update); "
@@ -542,7 +556,8 @@ def main():
     at_target = [r for r in results if r["rate"] == TARGET]
     if at_target and not args.no_steering:
         b = max(at_target, key=lambda r: r["got"])
-        steered = test_steering(rep, radio, uri, b["buffer"], b["kbufs"], args.seconds)
+        d_rates = [r for r in rates if r == 19_200_000] + [TARGET]   # the whole-band rates
+        steered = test_steering(rep, radio, uri, d_rates, b["buffer"], b["kbufs"], args.seconds)
     verdict(rep, capture, tcp, results, steered)
 
     out = Path(args.out or ROOT / f"recordings/linkdiag_{datetime.now():%Y%m%d-%H%M%S}")
