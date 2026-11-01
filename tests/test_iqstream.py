@@ -26,7 +26,7 @@ def test_test_pattern_matches_the_c_formula():
 @pytest.mark.parametrize("conns, bits", [(1, 16), (2, 16), (1, 12), (2, 12)])
 def test_streamer_loopback(conns, bits):
     r = IQ.PackedPluto("packed:127.0.0.1", 0, 21.6e6, buffer_size=1 << 15, conns=conns, bits=bits,
-                       test_rate=0, local=True, port=5340 + 2 * conns + bits % 2)
+                       test_rate=0, local=True, port=5340 + 10 * conns + bits)
     r._skip_until = -1
     try:
         for _ in range(200):
