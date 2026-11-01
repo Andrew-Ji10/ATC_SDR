@@ -324,22 +324,37 @@ def stream(uri, rate, buffer, kbufs, seconds, radio):
 
 def test_stream(rep, radio, uri, rates, seconds):
     rep.section("C. The libiio stream (iiod), as the recorder uses it")
-    rep(f"  {'MSPS':>6} {'buffer':>9} {'kbufs':>5} {'delivered':>10} {'MB/s':>6} {'iiod':>6} "
-        f"{'radio cores':>16} {'this pc':>8}")
+    rep(f"  {'asked':>6} {'buffer':>9} {'kbufs':>5} {'delivered':>10} {'arrived':>8} {'MB/s':>5} "
+        f"{'iiod':>5} {'radio cores':>12} {'this pc':>8}")
     results = []
-    plan = [(r, *DEFAULT_BUFFER) for r in rates] + [(TARGET, b, k) for b, k in BUFFERS if (b, k) != DEFAULT_BUFFER]
-    for rate, buffer, kbufs in plan:
-        res = stream(uri, rate, buffer, kbufs, seconds, radio)
-        if res.get("error") and "got" not in res:
-            rep(f"  {rate / 1e6:6.2f} {buffer:9d} {kbufs:5d}  could not open: {res['error'][:60]}")
-            continue
-        res.update(rate=rate, buffer=buffer, kbufs=kbufs)
-        results.append(res)
-        cores = " ".join(f"{v:3.0f}%" for _, v in sorted(res["busy"].items()))
-        rep(f"  {rate / 1e6:6.2f} {buffer:9d} {kbufs:5d} {100 * res['got']:9.0f}% "
-            f"{res['got'] * rate * BYTES_PER_SAMPLE / 1e6:6.0f} {res['iiod']:5.0f}% {cores:>16} "
-            f"{res['pi']:7.0f}%" + (f"  ({res['error'][:40]})" if res["error"] else ""))
-    rep("  delivered = % of the rate that arrived; iiod = % of one radio core; this pc = % of one core")
+
+    def run(plan):
+        for rate, buffer, kbufs in plan:
+            res = stream(uri, rate, buffer, kbufs, seconds, radio)
+            if res.get("error") and "got" not in res:
+                rep(f"  {rate / 1e6:6.2f} {buffer:9d} {kbufs:5d}  could not open: {res['error'][:60]}")
+                continue
+            res.update(rate=rate, buffer=buffer, kbufs=kbufs)
+            results.append(res)
+            cores = " ".join(f"{v:3.0f}%" for _, v in sorted(res["busy"].items()))
+            rep(f"  {rate / 1e6:6.2f} {buffer:9d} {kbufs:5d} {100 * res['got']:9.0f}% "
+                f"{res['got'] * rate / 1e6:7.1f}  {res['got'] * rate * BYTES_PER_SAMPLE / 1e6:5.0f} "
+                f"{res['iiod']:4.0f}% {cores:>12} {res['pi']:7.0f}%"
+                + (f"  ({res['error'][:40]})" if res["error"] else ""))
+
+    # Every rate with the recorder's buffers, then every buffer setting at the target rate...
+    run([(r, *DEFAULT_BUFFER) for r in rates]
+        + [(TARGET, b, k) for b, k in BUFFERS if (b, k) != DEFAULT_BUFFER])
+    # ...then the rates just below the target again, with whichever buffers did best there.
+    at_target = [r for r in results if r["rate"] == TARGET]
+    if at_target:
+        best = max(at_target, key=lambda r: r["got"])
+        if (best["buffer"], best["kbufs"]) != DEFAULT_BUFFER:
+            rep(f"  -- the rates below {TARGET / 1e6:g} again, with the best buffers "
+                f"({best['buffer']} x {best['kbufs']}):")
+            run([(r, best["buffer"], best["kbufs"]) for r in rates if 14_000_000 <= r < TARGET])
+    rep("  asked / arrived = MSPS requested / received; delivered = arrived / asked; "
+        "iiod = % of one radio core; this pc = % of one core")
     return results
 
 
