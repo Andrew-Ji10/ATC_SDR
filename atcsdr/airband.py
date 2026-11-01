@@ -318,6 +318,8 @@ def max_rate(uri, cap_msps=None):
 
 
 def link_name(uri):
+    if pluto.is_packed(uri):
+        return "Ethernet, 12-bit iqstream"
     return "RTL-SDR" if is_rtl(uri) else "Ethernet" if is_ethernet(uri) else "USB"
 
 

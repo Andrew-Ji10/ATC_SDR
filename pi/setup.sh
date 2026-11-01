@@ -66,7 +66,7 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
     $SUDO apt-get update -q
     $SUDO apt-get install -y -q python3 python3-venv python3-pip python3-numpy \
         python3-scipy python3-matplotlib python3-tqdm python3-joblib \
-        libiio-utils lame usbutils iputils-ping rtl-sdr sshpass
+        libiio-utils lame usbutils iputils-ping rtl-sdr sshpass \n        gcc gcc-arm-linux-gnueabihf
     # The libiio Python bindings: from apt if this release packages them, else pip.
     if apt-cache show python3-libiio >/dev/null 2>&1; then
         $SUDO apt-get install -y -q python3-libiio
@@ -151,6 +151,9 @@ EOF
     "$PY" -m pip install -q noisereduce numba "pyModeS>=3" $PIP_IIO
     ok "noisereduce, numba, pyModeS${PIP_IIO:+, $PIP_IIO} installed"
 
+    say "iqstream (12-bit sample streamer for the radio)"
+    bash "$ROOT/pi/build_iqstream.sh" && ok "built build/iqstream-armhf"         || warn "couldn't build iqstream (only needed for --device packed:...)"
+
     mkdir -p "$ROOT/recordings/logs"
     chmod +x "$ROOT/pi/"*.sh "$ROOT/radio/"*.py 2>/dev/null || true
 fi
@@ -191,8 +194,8 @@ else
 fi
 
 case "$PLUTO" in
-    ip:*)
-        HOST="${PLUTO#ip:}"
+    ip:*|packed:*)
+        HOST="${PLUTO#*:}"
         if ping -c 1 -W 2 "$HOST" >/dev/null 2>&1; then
             ok "Pluto answers ping at $HOST ($(ip route get "$HOST" 2>/dev/null | grep -o 'dev [^ ]*' || true))"
         else
@@ -216,7 +219,7 @@ import os, sys
 sys.path.insert(0, ".")
 from atcsdr import pluto
 iio = pluto._iio()
-uri = pluto.find_uri(os.environ["PLUTO"])
+uri = pluto.find_uri(os.environ["PLUTO"].replace("packed:", "ip:"))
 try:
     ctx = iio.Context(uri)
 except OSError as e:

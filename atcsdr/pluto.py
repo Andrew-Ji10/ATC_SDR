@@ -38,12 +38,21 @@ USB_NETWORK = "ip:192.168.2."   # the Pluto's network-over-USB address: still a 
 FALLBACK_URI = "ip:192.168.2.1"
 
 
+PACKED_MAX_RATE = 21_600_000  # packed:<address>, 12-bit via iqstream: the whole band (to be measured)
+
+
+def is_packed(uri):
+    return uri.startswith("packed:")
+
+
 def is_ethernet(uri):
-    return uri.startswith("ip:") and not uri.startswith(USB_NETWORK)
+    return is_packed(uri) or (uri.startswith("ip:") and not uri.startswith(USB_NETWORK))
 
 
 def max_rate(uri):
     """Highest sample rate the link to this Pluto can carry."""
+    if is_packed(uri):
+        return PACKED_MAX_RATE
     return NET_MAX_RATE if is_ethernet(uri) else USB_MAX_RATE
 
 
@@ -70,14 +79,8 @@ class Pluto:
     def _open(self):
         iio = _iio()
         self.ctx = iio.Context(self.uri)
-        phy = self.ctx.find_device("ad9361-phy")
         rx = self.ctx.find_device("cf-ad9361-lpc")
-        self._lo = phy.find_channel("altvoltage0", True)
-        ch = phy.find_channel("voltage0", False)
-        ch.attrs["sampling_frequency"].value = str(self.rate)
-        ch.attrs["rf_bandwidth"].value = str(self.bandwidth)
-        self._rx_phy = ch
-        self.set_gain(self.gain)
+        self._lo, self._rx_phy = configure_rx(self.ctx, self.rate, self.bandwidth, self.gain)
         for name in ("voltage0", "voltage1"):
             rx.find_channel(name, False).enabled = True
         rx.set_kernel_buffers_count(self.kernel_buffers)
@@ -86,12 +89,7 @@ class Pluto:
 
     def set_gain(self, gain):
         """A gain in dB, or one of GAIN_MODES."""
-        ch = self._rx_phy
-        if gain in GAIN_MODES:
-            ch.attrs["gain_control_mode"].value = GAIN_MODES[gain]
-        else:
-            ch.attrs["gain_control_mode"].value = "manual"
-            ch.attrs["hardwaregain"].value = str(float(gain))
+        set_gain(self._rx_phy, gain)
         self.gain = gain
 
     def tune(self, center):
@@ -127,10 +125,39 @@ class Pluto:
         return None
 
 
+def configure_rx(ctx, rate, bandwidth, gain):
+    """Set RX1's sample rate, RF bandwidth and gain. Returns (LO channel, RX channel)."""
+    phy = ctx.find_device("ad9361-phy")
+    ch = phy.find_channel("voltage0", False)
+    ch.attrs["sampling_frequency"].value = str(int(rate))
+    ch.attrs["rf_bandwidth"].value = str(int(bandwidth))
+    set_gain(ch, gain)
+    return phy.find_channel("altvoltage0", True), ch
+
+
+def set_gain(ch, gain):
+    """A gain in dB, or one of GAIN_MODES, on an RX channel."""
+    if gain in GAIN_MODES:
+        ch.attrs["gain_control_mode"].value = GAIN_MODES[gain]
+    else:
+        ch.attrs["gain_control_mode"].value = "manual"
+        ch.attrs["hardwaregain"].value = str(float(gain))
+
+
+def make(uri, center, rate, gain="40", **kwargs):
+    """The radio behind `uri`: packed:<address> streams through iqstream (12-bit,
+    see atcsdr.iqstream); anything else through libiio / iiod. Raises OSError."""
+    if is_packed(uri):
+        from .iqstream import PackedPluto
+        kwargs.pop("kernel_buffers", None)
+        return PackedPluto(uri, center, rate, gain, **kwargs)
+    return Pluto(uri, center, rate, gain, **kwargs)
+
+
 def open_pluto(uri, center, rate, gain="40", **kwargs):
     """A Pluto, or exit with a hint if it can't be opened."""
     try:
-        return Pluto(uri, center, rate, gain, **kwargs)
+        return make(uri, center, rate, gain, **kwargs)
     except OSError as e:
         sys.exit(f"Could not open Pluto at {uri}: {e}\nTry `iio_info -s` to list devices. "
                  "Only one program can use the Pluto at a time.")

@@ -10,3 +10,4 @@ recordings/
 .pytest_cache/
 .venv/
 pi/pluto.conf
+build/

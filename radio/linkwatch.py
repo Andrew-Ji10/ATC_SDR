@@ -108,7 +108,7 @@ def stream(uri, rate, center, gain, stats, log, stop):
     while not stop.is_set():
         if radio is None:
             try:
-                radio = pluto.Pluto(uri, center, rate, gain, buffer_size=buf)
+                radio = pluto.make(uri, center, rate, gain, buffer_size=buf)
             except OSError as e:
                 if down_since is None:
                     down_since = time.time()
@@ -160,7 +160,7 @@ def main():
     signal.signal(signal.SIGTERM, _terminate)
 
     uri = pluto.find_uri(args.device)
-    host = uri.split(":", 1)[1] if uri.startswith("ip:") else None
+    host = uri.split(":", 1)[1] if uri.startswith(("ip:", "packed:")) else None
     dev = route_dev(host) if host else None
     rate = int(args.rate * 1e6)
     out = Path(args.out or f"recordings/linktest_{datetime.now():%Y%m%d-%H%M%S}")

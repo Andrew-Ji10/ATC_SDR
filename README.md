@@ -14,6 +14,7 @@ Tools for listening to, recording and decoding Bay Area air traffic with an ADAL
 | [radio/bay_all.py](radio/bay_all.py) | Surveys all 43 Bay Area channels to see what you can pick up |
 | [radio/record.py](radio/record.py), [pi/record.sh](pi/record.sh) | Records any channel set for a set time, unattended (e.g. on a Raspberry Pi) |
 | [radio/linkwatch.py](radio/linkwatch.py), [pi/linktest.sh](pi/linktest.sh) | Watches the Pi-Pluto link for hours and logs every drop, stall and reconnect |
+| [radio/iqstream/iqstream.c](radio/iqstream/iqstream.c), [pi/iqstream_test.sh](pi/iqstream_test.sh) | The 12-bit streamer for the radio (`--device packed:...`), and its check |
 | [radio/link_diag.py](radio/link_diag.py), [pi/linkdiag.sh](pi/linkdiag.sh) | Finds why the Pluto can't stream 21.6 MSPS: radio capture, network stack or iiod |
 | [radio/dsp_bench.py](radio/dsp_bench.py), [pi/dspbench.sh](pi/dspbench.sh) | Benchmarks the DSP for the whole band in one window (21.6 MSPS), single- and multi-core |
 | [radio/characterize.py](radio/characterize.py), [pi/characterize.sh](pi/characterize.sh) | Measures CPU, link and RF (gain sweep, interference), and recommends `--max-rate` / `--gain` |
@@ -166,6 +167,31 @@ runs three tests to find the bottleneck, reading the radio's CPU load over SSH a
 The verdict says which part is the limit and what would fix it: buffer settings, a
 newer `iiod`, a custom streaming program on the radio (12-bit samples need 65 MB/s), or
 processing on the radio's FPGA.
+
+#### iqstream: the 12-bit streamer
+
+The radio's samples are 12 bits, but `iiod` sends them in 16-bit slots, and one of the
+radio's ARM cores can't push 21.6 MSPS (86 MB/s) through TCP. `iqstream`
+([radio/iqstream/iqstream.c](radio/iqstream/iqstream.c)) packs them to 12 bits (65 MB/s)
+and sends them from threads pinned to the radio's two cores. It runs from the radio's
+RAM (`/tmp`), so nothing is written to its flash and a reboot removes it. Tuning, gain and
+sample rate still go through `iiod`.
+
+```sh
+pi/iqstream_test.sh             # builds it, then checks it (~2 minutes); --loopback-only: no radio
+```
+
+The check runs in three stages:
+
+1. A loopback test on the Pi, checking every sample exactly.
+2. The radio sending a test pattern flat out: how much it can pack and send, with 1 and
+   2 connections.
+3. The radio's real samples at 19.2 and 21.6 MSPS, with 16-bit for comparison.
+
+The other scripts use it with `--device packed:192.168.3.2` (or `bash pi/setup.sh --pluto
+packed:192.168.3.2`). The Pi builds it with the ARM cross compiler (`pi/build_iqstream.sh`,
+run by setup), and copies it to the radio over SSH whenever the radio's copy is missing or
+out of date.
 
 #### DSP benchmark: the whole band in one window?
 

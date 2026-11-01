@@ -146,7 +146,7 @@ def bench(freqs, rate, windows, seconds):
 
 def open_radio(uri, center, rate, gain):
     try:
-        return pluto.Pluto(uri, center, rate, gain)
+        return pluto.make(uri, center, rate, gain)
     except OSError as e:
         return str(e)
 
