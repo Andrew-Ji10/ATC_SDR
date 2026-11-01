@@ -27,7 +27,15 @@
  *
  *   iqstream [-p port] [-n connections] [-b samples per chunk] [-s chunks]
  *            [-f 12|16] [-m mmap|read] [-k] [-w socket send buffer bytes]
+ *            [-S bytes per send() call] [-i core for the Ethernet interrupt]
  *            [-c reader,sender0,sender1 cores]
+ *
+ * -S: while a thread is inside send(), it holds the connection's lock, and the
+ * ACKs that arrive meanwhile are queued for that thread to process itself.
+ * With one long send() per block, a sender that falls a little behind never
+ * lets go, takes on all the ACK work, and stays behind (measured: 100% of a
+ * core at 96% of 21.6 MSPS, against 77% at 100%). Smaller pieces let the ACKs
+ * be handled by the interrupt's core in between.
  *            [-t] [-r test MSPS] [-d IIO device name]
  */
 #define _GNU_SOURCE
@@ -86,12 +94,12 @@ struct slot {
 };
 
 static struct {
-    int port, conns, slots, packed, test, mmap_mode, copy_first, sndbuf;
+    int port, conns, slots, packed, test, mmap_mode, copy_first, sndbuf, piece, irq_cpu;
     size_t samples;
     double test_msps;
     int cpu_reader, cpu_sender[MAX_CONNS];
     const char *device;
-} opt = {5300, 2, 8, 1, 0, 1, 0, 0, 1 << 17, 0.0, 0, {1, 0}, "cf-ad9361-lpc"};
+} opt = {5300, 2, 8, 1, 0, 1, 0, 0, 0, -1, 1 << 17, 0.0, 0, {1, 0}, "cf-ad9361-lpc"};
 /* Default cores: the Ethernet interrupts land on core 0, so the first sender
  * (the only one with -n 1) runs on core 1; the reader shares core 0. */
 
@@ -476,7 +484,8 @@ static int send_all(int fd, const void *buf, size_t n)
 {
     const uint8_t *p = buf;
     while (n) {
-        ssize_t r = send(fd, p, n, MSG_NOSIGNAL);
+        size_t k = (opt.piece > 0 && n > (size_t)opt.piece) ? (size_t)opt.piece : n;
+        ssize_t r = send(fd, p, k, MSG_NOSIGNAL);
         if (r < 0 && errno == EINTR)
             continue;
         if (r <= 0)
@@ -556,6 +565,46 @@ static void *sender(void *p)
     return NULL;
 }
 
+/* ------------------------------------------------------------ the Ethernet interrupt */
+
+#define MAX_IRQS 4
+static int irqs[MAX_IRQS], n_irqs;
+static char irq_masks[MAX_IRQS][32];
+
+/* Pin the Ethernet interrupt(s) to one core, keeping the old masks for later. */
+static void pin_irqs(int cpu)
+{
+    FILE *f = fopen("/proc/interrupts", "r");
+    char line[512], path[64], mask[32];
+    if (!f)
+        return;
+    while (fgets(line, sizeof line, f) && n_irqs < MAX_IRQS) {
+        int irq;
+        if ((strstr(line, "eth0") || strstr(line, "ethernet")) && sscanf(line, " %d:", &irq) == 1) {
+            snprintf(path, sizeof path, "/proc/irq/%d/smp_affinity", irq);
+            if (read_attr(path, irq_masks[n_irqs], sizeof irq_masks[0]))
+                continue;
+            snprintf(mask, sizeof mask, "%x", 1u << cpu);
+            if (write_attr(path, mask))
+                fprintf(stderr, "iqstream: couldn't pin interrupt %d to core %d\n", irq, cpu);
+            else
+                fprintf(stderr, "iqstream: Ethernet interrupt %d on core %d (was mask %s)\n",
+                        irq, cpu, irq_masks[n_irqs]);
+            irqs[n_irqs++] = irq;
+        }
+    }
+    fclose(f);
+}
+
+static void restore_irqs(void)
+{
+    char path[64];
+    for (int i = 0; i < n_irqs; i++) {
+        snprintf(path, sizeof path, "/proc/irq/%d/smp_affinity", irqs[i]);
+        write_attr(path, irq_masks[i]);
+    }
+}
+
 /* ------------------------------------------------------------ main */
 
 static void on_signal(int sig)
@@ -591,6 +640,8 @@ static void usage(void)
             "  -s chunks in flight (8)  -f 12|16 (12)  -m mmap|read: capture (mmap)\n"
             "  -k copy each DMA block to cached memory before packing\n"
             "  -w socket send buffer, bytes (0 = the kernel's default)\n"
+            "  -S bytes per send() call (0 = a whole chunk at a time)\n"
+            "  -i core for the Ethernet interrupt (restored on exit; default: leave it)\n"
             "  -c reader,sender0,sender1 cores (0,1,0; -1 = any)\n"
             "  -t test pattern instead of the radio  -r test pace in MSPS (0 = flat out)\n"
             "  -d IIO device (cf-ad9361-lpc)\n");
@@ -600,7 +651,7 @@ static void usage(void)
 int main(int argc, char **argv)
 {
     int c;
-    while ((c = getopt(argc, argv, "p:n:b:s:f:m:kw:c:tr:d:h")) != -1) {
+    while ((c = getopt(argc, argv, "p:n:b:s:f:m:kw:S:i:c:tr:d:h")) != -1) {
         switch (c) {
         case 'p': opt.port = atoi(optarg); break;
         case 'n': opt.conns = atoi(optarg); break;
@@ -610,6 +661,8 @@ int main(int argc, char **argv)
         case 'm': opt.mmap_mode = strcmp(optarg, "read") != 0; break;
         case 'k': opt.copy_first = 1; break;
         case 'w': opt.sndbuf = atoi(optarg); break;
+        case 'S': opt.piece = atoi(optarg); break;
+        case 'i': opt.irq_cpu = atoi(optarg); break;
         case 'c':
             if (sscanf(optarg, "%d,%d,%d", &opt.cpu_reader, &opt.cpu_sender[0], &opt.cpu_sender[1]) < 1)
                 usage();
@@ -667,6 +720,8 @@ int main(int argc, char **argv)
     }
     close(srv);
 
+    if (opt.irq_cpu >= 0)
+        pin_irqs(opt.irq_cpu);
     if (!opt.test)
         iio_start();
     if (!opt.mmap_mode)                         /* read mode: our own ring of chunks */
@@ -710,5 +765,6 @@ int main(int argc, char **argv)
         close(fds[i]);
     report("done", total, since_start);          /* every thread has saved its CPU time */
     iio_stop();
+    restore_irqs();
     return 0;
 }

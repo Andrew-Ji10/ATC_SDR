@@ -169,19 +169,33 @@ class PackedPluto:
     on the radio; cpus = iqstream's -c (reader,sender0,sender1); capture =
     "mmap" (the DMA blocks, no copy) or "read"; copy_first copies each block to
     cached memory before packing; sndbuf sets the radio's socket send buffer
-    (bytes, 0 = the kernel's default). For tests,
+    (bytes, 0 = the kernel's default); piece caps each send() call (bytes, 0 =
+    a whole chunk); irq pins the radio's Ethernet interrupt to that core.
+    Any of these can also come from the address, for scripts that only take a
+    --device: packed:192.168.3.2?piece=65536&irq=0. For tests,
     test_rate (MSPS) makes iqstream send its test pattern instead of the radio's
     samples, and local=True runs build/iqstream-native on this computer."""
 
     def __init__(self, uri, center, rate, gain="40", bandwidth=None, buffer_size=1 << 19,
                  conns=1, bits=16, cpus=None, password="analog", port=PORT,
-                 test_rate=None, local=False, capture="mmap", copy_first=False, sndbuf=4 << 20):
-        self.uri, self.host = uri, uri.split(":", 1)[1]
+                 test_rate=None, local=False, capture="mmap", copy_first=False, sndbuf=4 << 20,
+                 piece=0, irq=None):
+        base, _, query = uri.partition("?")
+        self.uri, self.host = uri, base.split(":", 1)[1]
+        opts = dict(kv.split("=", 1) for kv in query.split("&") if "=" in kv)
+        conns = int(opts.get("conns", conns))
+        bits = int(opts.get("bits", bits))
+        buffer_size = int(opts.get("block", buffer_size))
+        sndbuf = int(opts.get("sndbuf", sndbuf))
+        piece = int(opts.get("piece", piece))
+        irq = int(opts["irq"]) if "irq" in opts else irq
+        cpus = opts.get("cpus", cpus)
         self.center, self.rate, self.gain = center, int(rate), gain
         self.bandwidth = int(bandwidth or rate)
         self.samples, self.conns, self.bits, self.cpus = buffer_size, conns, bits, cpus
         self.password, self.port, self.test_rate, self.local = password, port, test_rate, local
         self.capture, self.copy_first, self.sndbuf = capture, copy_first, sndbuf
+        self.piece, self.irq = piece, irq
         self.stats = dict(chunks=0, lost=0)
         self.shell = self.ctx = self._lo = self._rx_phy = self._proc = None
         self._socks, self._threads = [], []
@@ -195,6 +209,10 @@ class PackedPluto:
             a += " -k"
         if self.sndbuf:
             a += f" -w {self.sndbuf}"
+        if self.piece:
+            a += f" -S {self.piece}"
+        if self.irq is not None:
+            a += f" -i {self.irq}"
         if self.cpus:
             a += f" -c {self.cpus}"
         if self.test_rate is not None:

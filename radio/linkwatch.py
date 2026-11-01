@@ -161,7 +161,7 @@ def main():
     signal.signal(signal.SIGTERM, _terminate)
 
     uri = pluto.find_uri(args.device)
-    host = uri.split(":", 1)[1] if uri.startswith(("ip:", "packed:")) else None
+    host = uri.split("?")[0].split(":", 1)[1] if uri.startswith(("ip:", "packed:")) else None
     dev = route_dev(host) if host else None
     rate = int(args.rate * 1e6)
     out = Path(args.out or f"recordings/linktest_{datetime.now():%Y%m%d-%H%M%S}")
