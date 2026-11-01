@@ -26,7 +26,8 @@
  *          2 = test pattern (-t), not the radio
  *
  *   iqstream [-p port] [-n connections] [-b samples per chunk] [-s chunks]
- *            [-f 12|16] [-m mmap|read] [-k] [-c reader,sender0,sender1 cores]
+ *            [-f 12|16] [-m mmap|read] [-k] [-w socket send buffer bytes]
+ *            [-c reader,sender0,sender1 cores]
  *            [-t] [-r test MSPS] [-d IIO device name]
  */
 #define _GNU_SOURCE
@@ -85,12 +86,12 @@ struct slot {
 };
 
 static struct {
-    int port, conns, slots, packed, test, mmap_mode, copy_first;
+    int port, conns, slots, packed, test, mmap_mode, copy_first, sndbuf;
     size_t samples;
     double test_msps;
     int cpu_reader, cpu_sender[MAX_CONNS];
     const char *device;
-} opt = {5300, 2, 8, 1, 0, 1, 0, 1 << 17, 0.0, 0, {1, 0}, "cf-ad9361-lpc"};
+} opt = {5300, 2, 8, 1, 0, 1, 0, 0, 1 << 17, 0.0, 0, {1, 0}, "cf-ad9361-lpc"};
 /* Default cores: the Ethernet interrupts land on core 0, so the first sender
  * (the only one with -n 1) runs on core 1; the reader shares core 0. */
 
@@ -589,6 +590,7 @@ static void usage(void)
             "  -p port (5300)  -n connections, 1-2 (2)  -b samples per chunk (131072)\n"
             "  -s chunks in flight (8)  -f 12|16 (12)  -m mmap|read: capture (mmap)\n"
             "  -k copy each DMA block to cached memory before packing\n"
+            "  -w socket send buffer, bytes (0 = the kernel's default)\n"
             "  -c reader,sender0,sender1 cores (0,1,0; -1 = any)\n"
             "  -t test pattern instead of the radio  -r test pace in MSPS (0 = flat out)\n"
             "  -d IIO device (cf-ad9361-lpc)\n");
@@ -598,7 +600,7 @@ static void usage(void)
 int main(int argc, char **argv)
 {
     int c;
-    while ((c = getopt(argc, argv, "p:n:b:s:f:m:kc:tr:d:h")) != -1) {
+    while ((c = getopt(argc, argv, "p:n:b:s:f:m:kw:c:tr:d:h")) != -1) {
         switch (c) {
         case 'p': opt.port = atoi(optarg); break;
         case 'n': opt.conns = atoi(optarg); break;
@@ -607,6 +609,7 @@ int main(int argc, char **argv)
         case 'f': opt.packed = atoi(optarg) == 12; break;
         case 'm': opt.mmap_mode = strcmp(optarg, "read") != 0; break;
         case 'k': opt.copy_first = 1; break;
+        case 'w': opt.sndbuf = atoi(optarg); break;
         case 'c':
             if (sscanf(optarg, "%d,%d,%d", &opt.cpu_reader, &opt.cpu_sender[0], &opt.cpu_sender[1]) < 1)
                 usage();
@@ -650,6 +653,17 @@ int main(int argc, char **argv)
         fds[i] = accept(srv, NULL, NULL);
         if (fds[i] < 0)
             die("accept: %s", strerror(errno));
+        if (opt.sndbuf > 0) {
+            /* As root, SNDBUFFORCE gets past net.core.wmem_max; the kernel doubles it. */
+            int got = 0;
+            socklen_t len = sizeof got;
+#ifdef SO_SNDBUFFORCE
+            if (setsockopt(fds[i], SOL_SOCKET, SO_SNDBUFFORCE, &opt.sndbuf, sizeof opt.sndbuf))
+#endif
+                setsockopt(fds[i], SOL_SOCKET, SO_SNDBUF, &opt.sndbuf, sizeof opt.sndbuf);
+            getsockopt(fds[i], SOL_SOCKET, SO_SNDBUF, &got, &len);
+            fprintf(stderr, "iqstream: connection %d send buffer %d bytes\n", i, got);
+        }
     }
     close(srv);
 

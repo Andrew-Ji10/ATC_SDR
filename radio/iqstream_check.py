@@ -33,7 +33,7 @@ sys.path.insert(0, str(ROOT / "radio"))
 from atcsdr import iqstream as IQ
 from atcsdr import pluto
 
-FULL_BAND = (19_200_000, 21_600_000)
+FULL_BAND = (19_200_000, 20_000_000, 21_600_000)
 
 
 class Report:
@@ -149,37 +149,56 @@ def radio_test(rep, host, password, seconds, snap):
     return out
 
 
-# (MSPS, bits, connections, capture, copy first): what each run isolates. On the
-# first run, 16-bit straight from the DMA block (1 connection) did 81 MB/s at
-# 21.6 MSPS, and packing to 12 bits cost the radio more than it saved.
+# (MSPS, connections, samples per DMA block, socket send buffer): all 16-bit,
+# straight from the DMA block, which did 81 MB/s (20.3 MSPS) at 21.6 on the
+# second run. The rest are the cheap knobs for the last 6%.
+BLOCK, BIG = 1 << 17, 1 << 19
 PLAN = [
-    (19_200_000, 16, 1, "mmap", False),   # the whole band, outer channels nearer the band edges
-    (19_200_000, 16, 2, "mmap", False),
-    (21_600_000, 16, 1, "mmap", False),   # the whole band, with the usual margins
-    (21_600_000, 16, 2, "mmap", False),   # a second sender on the other core
-    (21_600_000, 12, 2, "mmap", True),    # 12-bit for comparison: copy first, two packers
+    (21_600_000, 1, BLOCK, 0),         # the 81 MB/s baseline
+    (21_600_000, 2, BLOCK, 0),         # a second sender, on the other core
+    (21_600_000, 1, BIG, 0),           # 4x bigger blocks: fewer hand-offs and system calls
+    (21_600_000, 1, BIG, 4 << 20),     # ... plus a 4 MB socket send buffer
+    (21_600_000, 2, BIG, 4 << 20),     # ... plus a second sender
+    (20_000_000, 1, BIG, 0),           # the whole band with 88% of the band usable
+    (19_200_000, 1, BLOCK, 0),         # ... with 92%
 ]
 
 
+def jumbo_probe(rep, host, password):
+    """Can the radio's Ethernet take 9000-byte frames? (Set back to 1500 at once.)"""
+    rep.section("Jumbo frames (9000-byte MTU) on the radio")
+    try:
+        shell = IQ.RadioShell(host, password)
+        out = shell.text("ip link set dev eth0 mtu 9000 2>&1; echo rc=$?; "
+                         "ip link set dev eth0 mtu 1500 2>&1; cat /sys/class/net/eth0/mtu", timeout=20)
+    except Exception as e:                           # the link may blink while the MTU changes
+        rep(f"  couldn't tell ({e})")
+        return None
+    ok = "rc=0" in out
+    rep("  supported: the Pi's eth0 would need MTU 9000 too (sudo ip link set dev eth0 mtu 9000), "
+        "and both sides back to 1500 afterwards" if ok else
+        f"  not supported ({out.split('rc=')[0].strip()[:80] or 'refused'}): stays at 1500")
+    return ok
+
+
 def real(rep, host, password, seconds, snap):
-    rep.section("3. The radio's real samples")
-    rep(f"  {'MSPS':>5} {'bits':>4} {'conns':>5} {'capture':>12} {'delivered':>9} {'arrived':>7} "
+    rep.section("3. The radio's real samples (16-bit, straight from the DMA block)")
+    rep(f"  {'MSPS':>5} {'conns':>5} {'block':>7} {'sndbuf':>6} {'delivered':>9} {'arrived':>7} "
         f"{'MB/s':>5}  radio cores")
     out = []
-    for rate, bits, conns, capture, copy in PLAN:
-        name = capture + (", copy" if copy else "")
+    for rate, conns, block, sndbuf in PLAN:
         try:
-            r = IQ.PackedPluto(f"packed:{host}", 127e6, rate, conns=conns, bits=bits, password=password,
-                               capture=capture, copy_first=copy)
+            r = IQ.PackedPluto(f"packed:{host}", 127e6, rate, conns=conns, buffer_size=block,
+                               sndbuf=sndbuf, password=password)
         except OSError as e:
-            rep(f"  {rate / 1e6:5.1f} {bits:4d} {conns:5d} {name:>12}  couldn't start: {e}")
+            rep(f"  {rate / 1e6:5.1f} {conns:5d} {block:7d} {sndbuf >> 20:5d}M  couldn't start: {e}")
             continue
         res = measure(r, seconds, snap=snap)
-        log = radio_log(r, "capturing with", "done", "no DMA block", "failed")
-        res.update(rate=rate, bits=bits, conns=conns, capture=name)
+        log = radio_log(r, "done", "send buffer", "no DMA block", "failed")
+        res.update(rate=rate, bits=16, conns=conns, block=block, sndbuf=sndbuf)
         out.append(res)
-        rep(f"  {rate / 1e6:5.1f} {bits:4d} {conns:5d} {name:>12} {100 * res['sps'] / rate:8.0f}% "
-            f"{res['sps'] / 1e6:7.1f} {res['sps'] * (3 if bits == 12 else 4) / 1e6:5.0f}  "
+        rep(f"  {rate / 1e6:5.1f} {conns:5d} {block:7d} {(str(sndbuf >> 20) + 'M') if sndbuf else '-':>6} "
+            f"{100 * res['sps'] / rate:8.0f}% {res['sps'] / 1e6:7.1f} {res['sps'] * 4 / 1e6:5.0f}  "
             f"{fmt_load(res['load'])}" + (f"  error: {res['error']}" if res["error"] else ""))
         for line in log:
             rep(f"         radio: {line}")
@@ -200,22 +219,24 @@ def verdict(rep, ok_loop, test_runs, real_runs):
         r = best.get(rate)
         if r:
             full = r["sps"] >= 0.99 * rate and r["lost"] == 0
-            rep(f"{rate / 1e6:g} MSPS: best {100 * r['sps'] / rate:.0f}% ({r['bits']}-bit, {r['conns']} "
-                f"connection(s), {r['sps'] * (3 if r['bits'] == 12 else 4) / 1e6:.0f} MB/s)"
-                + ("  -> the whole band gets through" if full else ""))
+            rep(f"{rate / 1e6:g} MSPS: best {100 * r['sps'] / rate:.0f}% ({r['conns']} connection(s), "
+                f"blocks of {r['block']}, send buffer {(str(r['sndbuf'] >> 20) + ' MB') if r['sndbuf'] else 'default'}, "
+                f"{r['sps'] * 4 / 1e6:.0f} MB/s)" + ("  -> gets through in full" if full else ""))
     if test_runs:
         top = max(test_runs, key=lambda r: r["sps"])
         rep(f"test pattern (network only, no capture): {100 * top['sps'] / 21.6e6:.0f}% of 21.6 MSPS "
             f"with {top['conns']} connection(s)")
     win = lambda rate: (r := best.get(rate)) and r["sps"] >= 0.99 * rate and r["lost"] == 0
-    if win(FULL_BAND[1]):
-        r = best[FULL_BAND[1]]
-        rep(f"-> Use --device packed:<address> at 21.6 MSPS ({r['bits']}-bit, {r['conns']} connection(s)): "
-            "one window, all 43 channels.")
-    elif win(FULL_BAND[0]):
-        r = best[FULL_BAND[0]]
-        rep(f"-> 19.2 MSPS works ({r['bits']}-bit, {r['conns']} connection(s)): the whole band, if the outer "
-            "channels may sit nearer the band edges (characterize.sh shows their noise floor).")
+    if win(21_600_000):
+        r = best[21_600_000]
+        rep(f"-> 21.6 MSPS works with {r['conns']} connection(s), blocks of {r['block']}: one window, all "
+            "43 channels, with the usual margins.")
+    elif win(20_000_000):
+        rep("-> 20.0 MSPS works: the whole band, with 88% of the captured band used "
+            "(characterize.sh shows the outer channels' noise floor).")
+    elif win(19_200_000):
+        rep("-> 19.2 MSPS works: the whole band, with 92% of the captured band used "
+            "(characterize.sh shows the outer channels' noise floor).")
 
 
 def main():
@@ -243,6 +264,7 @@ def main():
             sys.exit(f"{IQ.BINARY} isn't built: run bash pi/build_iqstream.sh")
         test_runs = radio_test(rep, host, args.password, args.seconds, shell.snapshot)
         real_runs = real(rep, host, args.password, args.seconds, shell.snapshot)
+        jumbo_probe(rep, host, args.password)
         shell.run("killall iqstream 2>/dev/null")
     verdict(rep, ok_loop, test_runs, real_runs)
 

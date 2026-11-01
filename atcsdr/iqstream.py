@@ -166,19 +166,20 @@ class PackedPluto:
     21.6 MSPS). conns = TCP connections (1-2), each from its own pinned thread
     on the radio; cpus = iqstream's -c (reader,sender0,sender1); capture =
     "mmap" (the DMA blocks, no copy) or "read"; copy_first copies each block to
-    cached memory before packing. For tests,
+    cached memory before packing; sndbuf sets the radio's socket send buffer
+    (bytes, 0 = the kernel's default). For tests,
     test_rate (MSPS) makes iqstream send its test pattern instead of the radio's
     samples, and local=True runs build/iqstream-native on this computer."""
 
     def __init__(self, uri, center, rate, gain="40", bandwidth=None, buffer_size=1 << 17,
                  conns=1, bits=16, cpus=None, password="analog", port=PORT,
-                 test_rate=None, local=False, capture="mmap", copy_first=False):
+                 test_rate=None, local=False, capture="mmap", copy_first=False, sndbuf=0):
         self.uri, self.host = uri, uri.split(":", 1)[1]
         self.center, self.rate, self.gain = center, int(rate), gain
         self.bandwidth = int(bandwidth or rate)
         self.samples, self.conns, self.bits, self.cpus = buffer_size, conns, bits, cpus
         self.password, self.port, self.test_rate, self.local = password, port, test_rate, local
-        self.capture, self.copy_first = capture, copy_first
+        self.capture, self.copy_first, self.sndbuf = capture, copy_first, sndbuf
         self.stats = dict(chunks=0, lost=0)
         self.shell = self.ctx = self._lo = self._rx_phy = self._proc = None
         self._socks, self._threads = [], []
@@ -190,6 +191,8 @@ class PackedPluto:
         a = f"-p {self.port} -n {self.conns} -b {self.samples} -s {SLOTS} -f {self.bits} -m {self.capture}"
         if self.copy_first:
             a += " -k"
+        if self.sndbuf:
+            a += f" -w {self.sndbuf}"
         if self.cpus:
             a += f" -c {self.cpus}"
         if self.test_rate is not None:
