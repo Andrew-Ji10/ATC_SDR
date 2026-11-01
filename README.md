@@ -189,8 +189,8 @@ The check runs in three stages:
 3. The radio's real samples at 19.2 and 21.6 MSPS, with 16-bit for comparison.
 
 The other scripts use it with `--device packed:192.168.3.2` (or `bash pi/setup.sh --pluto
-packed:192.168.3.2`). The Pi builds it with the ARM cross compiler (`pi/build_iqstream.sh`,
-run by setup), and copies it to the radio over SSH whenever the radio's copy is missing or
+packed:192.168.3.2`). The Pi builds it with Zig's C compiler, installed by setup with pip, which cross-compiles
+for the radio's ARM with no apt packages (`pi/build_iqstream.sh`, run by setup), and copies it to the radio over SSH whenever the radio's copy is missing or
 out of date.
 
 #### DSP benchmark: the whole band in one window?

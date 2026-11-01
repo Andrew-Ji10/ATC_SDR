@@ -46,8 +46,8 @@
 
 #define VERSION "1"
 #define MAGIC 0x31535149u            /* "IQS1" */
-#define F_PACKED12 1u
-#define F_TEST 2u
+#define FLAG_PACKED12 1u
+#define FLAG_TEST 2u
 #define MAX_CONNS 2
 
 struct header {
@@ -386,7 +386,7 @@ static void *sender(void *p)
             data = s->out;
         }
         struct header h = {MAGIC, s->seq, (uint32_t)opt.samples,
-                           (opt.packed ? F_PACKED12 : 0) | (opt.test ? F_TEST : 0), s->lost, s->t_ns};
+                           (opt.packed ? FLAG_PACKED12 : 0) | (opt.test ? FLAG_TEST : 0), s->lost, s->t_ns};
         int ok = !send_all(a->fd, &h, sizeof h) && !send_all(a->fd, data, payload);
 
         pthread_mutex_lock(&mu);

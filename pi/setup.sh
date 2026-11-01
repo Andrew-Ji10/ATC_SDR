@@ -66,7 +66,7 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
     $SUDO apt-get update -q
     $SUDO apt-get install -y -q python3 python3-venv python3-pip python3-numpy \
         python3-scipy python3-matplotlib python3-tqdm python3-joblib \
-        libiio-utils lame usbutils iputils-ping rtl-sdr sshpass \n        gcc gcc-arm-linux-gnueabihf
+        libiio-utils lame usbutils iputils-ping rtl-sdr sshpass
     # The libiio Python bindings: from apt if this release packages them, else pip.
     if apt-cache show python3-libiio >/dev/null 2>&1; then
         $SUDO apt-get install -y -q python3-libiio
@@ -147,9 +147,10 @@ EOF
     [ -x "$PY" ] || python3 -m venv --system-site-packages "$VENV"
     "$PY" -m pip install -q --upgrade pip
     # numba: compiled, multi-core DSP (radio/dsp_bench.py). pyModeS: ADS-B decoding.
+    # ziglang: the C compiler that builds iqstream for the radio (pi/build_iqstream.sh).
     # shellcheck disable=SC2086
-    "$PY" -m pip install -q noisereduce numba "pyModeS>=3" $PIP_IIO
-    ok "noisereduce, numba, pyModeS${PIP_IIO:+, $PIP_IIO} installed"
+    "$PY" -m pip install -q noisereduce numba "pyModeS>=3" ziglang $PIP_IIO
+    ok "noisereduce, numba, pyModeS, ziglang${PIP_IIO:+, $PIP_IIO} installed"
 
     say "iqstream (12-bit sample streamer for the radio)"
     bash "$ROOT/pi/build_iqstream.sh" && ok "built build/iqstream-armhf"         || warn "couldn't build iqstream (only needed for --device packed:...)"
