@@ -14,6 +14,8 @@ Tools for listening to, recording and decoding Bay Area air traffic with an ADAL
 | [radio/bay_all.py](radio/bay_all.py) | Surveys all 43 Bay Area channels to see what you can pick up |
 | [radio/record.py](radio/record.py), [pi/record.sh](pi/record.sh) | Records any channel set for a set time, unattended (e.g. on a Raspberry Pi) |
 | [radio/linkwatch.py](radio/linkwatch.py), [pi/linktest.sh](pi/linktest.sh) | Watches the Pi-Pluto link for hours and logs every drop, stall and reconnect |
+| [radio/station_test.py](radio/station_test.py), [pi/station_test.sh](pi/station_test.sh) | ATC and ADS-B together on the planned core layout: uptime of each, per-core load, storage |
+| [radio/adsb_listen.py](radio/adsb_listen.py), [pi/adsb_listen.sh](pi/adsb_listen.sh) | ADS-B from the RTL-SDR for a set time: messages, tracks, health log, uptime |
 | [radio/atc_listen.py](radio/atc_listen.py), [pi/atc_listen.sh](pi/atc_listen.sh) | Listens to all 43 channels at once (full stack, 20.0 MSPS) for a set time: MP3 per transmission, health log, uptime |
 | [radio/iqstream/iqstream.c](radio/iqstream/iqstream.c), [pi/iqstream_test.sh](pi/iqstream_test.sh) | The streamer for the radio, faster than `iiod` (`--device packed:...`), and its check |
 | [radio/link_diag.py](radio/link_diag.py), [pi/linkdiag.sh](pi/linkdiag.sh) | Finds why the Pluto can't stream 21.6 MSPS: radio capture, network stack or iiod |
@@ -192,6 +194,37 @@ In `recordings/listen_<UTC time>/`:
 - `events.csv`: reconnects.
 - `summary.txt`: the uptime (the share of seconds fully received and kept up with),
   per-channel traffic, and the storage used, projected to a day, a week and a month.
+
+#### ADS-B listen test, and the station test (both at once)
+
+```sh
+pi/adsb_listen.sh 1h --ref 37.43 -122.17     # ADS-B alone, from the RTL-SDR
+pi/station_test.sh 1h --ref 37.43 -122.17    # ATC and ADS-B together
+```
+
+`adsb_listen.sh` decodes ADS-B from the RTL-SDR (1090 MHz, 2 MSPS) on core 2, for a set
+time. In `recordings/adsb_<UTC time>/`:
+
+- `messages.txt.gz`: every message, as `<unix time> <hex>`; decode it again with
+  `adsb/adsb_decode.py --hex`.
+- `positions.csv`, `aircraft.csv`: the tracks and the aircraft seen.
+- `health.csv`: one row per second: the % of samples received, decoder load, drops,
+  messages per second, aircraft in view.
+- `summary.txt`: uptime, traffic, and storage per day, week and month.
+
+`--ref` is your latitude and longitude. `adsb_decode.py` and `adsb_plot.py` also take the
+dongle, with `--rtl`.
+
+`station_test.sh` runs the ATC and ADS-B listen tests together, on the planned core layout:
+
+- ATC on cores 0-1, with its clips on core 3.
+- ADS-B on core 2.
+
+One status line shows both systems and each core's load. The summary gives each
+system's uptime, every core's average and peak load, temperature and throttling, and the
+storage for both. Each test's own files are in `atc/` and `adsb/`, and `cores.csv` logs the
+cores every 5 s. With `--atc-source synthetic --adsb-source synthetic` it runs with no
+radios at all, doing the same work, to check the Pi on its own.
 
 #### iqstream: a faster streamer than iiod
 

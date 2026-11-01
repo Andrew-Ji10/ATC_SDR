@@ -34,6 +34,7 @@ from .pluto import find_uri, open_pluto, to_complex
 
 ADSB_FREQ = 1090e6
 SAMP_RATE = 4e6
+RTL_RATE = 2e6               # what an RTL-SDR streams reliably; the demodulator takes 2 MSPS
 CHUNK = 1 << 20              # samples per buffer (~0.26 s at 4 MSPS)
 
 # Mode S timing in half-microsecond "slots": an 8 us preamble (16 slots) with
@@ -138,6 +139,8 @@ def add_source_args(p):
     """Input options shared by adsb/adsb_plot.py and adsb/adsb_decode.py."""
     src = p.add_mutually_exclusive_group()
     src.add_argument("--device", default="", help="Pluto libiio URI (default: auto-detect)")
+    src.add_argument("--rtl", nargs="?", const="rtl", metavar="rtl:N",
+                     help="an RTL-SDR at 1090 MHz, 2 MSPS (rtl, or rtl:N for the Nth dongle)")
     src.add_argument("--network", metavar="HOST:PORT",
                      help="dump1090/readsb raw output, e.g. localhost:30002")
     src.add_argument("--iq", metavar="FILE", help="recorded IQ file centered on 1090 MHz")
@@ -158,7 +161,14 @@ def start_source(args, out, stop):
     """Start the input chosen in `args` on a thread that puts (unix time, hex)
     on `out`, then None when it ends. A Pluto is opened here, on the calling
     thread, so errors reach the user."""
-    if args.network:
+    if getattr(args, "rtl", None):
+        from .rtl import open_rtl
+        gain = args.gain if args.gain != "50" else "40"     # 50 is the Pluto's default; R820T2 tops out ~50
+        rtl = open_rtl(args.rtl, ADSB_FREQ, RTL_RATE, gain)
+        print(f"RTL-SDR {args.rtl}: 1090 MHz, {RTL_RATE / 1e6:g} MSPS, gain {gain}")
+        target = _iq_reader, (_pluto_chunks(rtl, args.record, stop), RTL_RATE, args.min_snr, False,
+                              out, stop)
+    elif args.network:
         target = _network_reader, (args, out, stop)
     elif args.hex:
         target = _hex_file_reader, (args, out, stop)

@@ -9,6 +9,7 @@ ATC listen test: the full stack, the whole band at once, for as long as you like
 
     python3 radio/atc_listen.py --device packed:192.168.3.2 --duration 30m
     python3 radio/atc_listen.py --device packed:192.168.3.2 --duration 8h --threshold 10
+    python3 radio/atc_listen.py --source synthetic --duration 5m   # no radio: the same work
 
 Every second it logs to health.csv: the % of samples received, how busy the
 receiver was (1.0 = all of real time), its backlog, chunks lost, reconnects,
@@ -28,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,7 +44,8 @@ from atcsdr import pluto
 from atcsdr.airband import parse_duration
 
 UP_STREAM = 0.98             # a second counts as up if this much of it arrived (and nothing dropped)
-WARMUP_S = 2.0               # not counted: the stream starting up
+WARMUP_S = 2.0
+UP_WINDOW_S = 5.0          # judged over this long: a second holds a whole number of chunks               # not counted: the stream starting up
 TTY = sys.stdout.isatty()
 
 
@@ -78,6 +81,39 @@ def throttled():
 
 def _terminate(*_):
     raise KeyboardInterrupt
+
+
+class SyntheticRadio:
+    """No radio: pre-built chunks of noise, with AM transmissions coming and going on
+    two of the channels, at real-time pace. The receiver does exactly the real work."""
+
+    def __init__(self, rate, center, freqs, chunk=1 << 19):
+        rng = np.random.default_rng(0)
+        self.rate, self.n, self.k, self.t0 = rate, chunk, 0, time.time()
+        self.stats = dict(lost=0, chunks=0)
+        t = np.arange(chunk) / rate
+        self.talkers = [freqs[len(freqs) // 4], freqs[3 * len(freqs) // 4]]
+        tones = [300 * (1 + 0.5 * np.cos(2 * np.pi * 900 * t)) * np.exp(2j * np.pi * (f.mhz * 1e6 - center) * t)
+                 for f in self.talkers]
+        self.pool = {}
+        for on in ((0, 0), (1, 0), (0, 1), (1, 1)):
+            x = (rng.standard_normal(chunk) + 1j * rng.standard_normal(chunk)) * 20
+            x += sum(tone for tone, o in zip(tones, on) if o)
+            raw = np.empty(2 * chunk, np.int16)
+            raw[0::2], raw[1::2] = np.round(x.real), np.round(x.imag)
+            self.pool[on] = raw
+
+    def read(self):
+        time.sleep(max(0.0, self.t0 + (self.k + 1) * self.n / self.rate - time.time()))
+        s = self.k * self.n / self.rate
+        self.k += 1
+        return self.pool[(int(s // 5) % 3 == 1, int((s + 2) // 4) % 4 == 2)].copy()   # 5 s / 4 s talks
+
+    def close(self):
+        pass
+
+    def reconnect(self, stop):
+        return 0.0
 
 
 # ------------------------------------------------------------------ clips (own process)
@@ -116,6 +152,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--device", default="", help="the radio, e.g. packed:192.168.3.2 (iqstream)")
+    p.add_argument("--source", choices=["radio", "synthetic"], default="radio",
+                   help="synthetic: no radio, transmissions on two channels (default radio)")
     p.add_argument("--duration", type=parse_duration, default=parse_duration("10m"),
                    help="how long: 90s, 30m, 8h, 1d (default 10m); 0 = until Ctrl-C")
     p.add_argument("--rate", type=float, default=20.0, help="MSPS (default 20.0: all 43 channels)")
@@ -147,7 +185,7 @@ def main():
     Receiver(rate, freqs, args.threshold, threads=len(args.dsp_cores)).process(
         np.zeros(2 * (1 << 16), np.int16), time.time())
     rx = Receiver(rate, freqs, args.threshold, threads=len(args.dsp_cores))
-    uri = pluto.find_uri(args.device)
+    uri = pluto.find_uri(args.device) if args.source == "radio" else "synthetic"
     out = Path(args.out or ROOT / f"recordings/listen_{utc(time.time(), ms=False, files=True)}")
     for d in ("clips", "clips_clean"):
         (out / d).mkdir(parents=True, exist_ok=True)
@@ -163,7 +201,8 @@ def main():
     worker.start()
 
     try:
-        radio = pluto.make(uri, rx.center, rate, args.gain)
+        radio = (pluto.make(uri, rx.center, rate, args.gain) if args.source == "radio"
+                 else SyntheticRadio(rate, rx.center, freqs))
     except OSError as e:
         clip_q.put(None)
         sys.exit(f"Could not open the radio at {uri}: {e}")
@@ -226,6 +265,7 @@ def main():
     # Health, once a second.
     seconds, up_seconds, temps, worst_busy = [0], [0], [], [0.0]
     last = dict(received=0, dropped=0, busy=0.0, lost=0, t=time.time())
+    window = deque(maxlen=int(UP_WINDOW_S) + 1)          # (time, samples received so far)
 
     def monitor():
         while not stop.wait(1.0):
@@ -243,9 +283,11 @@ def main():
             t = temp_c()
             if t:
                 temps.append(t)
-            if now - started > WARMUP_S:                  # the stream's first seconds are start-up
+            window.append((now, stats["received"]))
+            got_w = (window[-1][1] - window[0][1]) / (rate * max(window[-1][0] - window[0][0], 1e-9))
+            if now - started > WARMUP_S + UP_WINDOW_S:    # the stream's first seconds are start-up
                 seconds[0] += 1
-                if got >= UP_STREAM and dropped == 0 and new_lost == 0:
+                if got_w >= UP_STREAM and dropped == 0 and new_lost == 0:
                     up_seconds[0] += 1
             worst_busy[0] = max(worst_busy[0], busy)
             health.write(f"{utc(now)},{100 * got:.1f},{busy:.2f},{raw_q.qsize()},{dropped},{new_lost},"
