@@ -12,6 +12,7 @@ Tools for listening to, recording and decoding Bay Area air traffic with an ADAL
 |---|---|
 | [radio/south_bay.py](radio/south_bay.py), [sfo.py](radio/sfo.py), [oak.py](radio/oak.py) | Records every tower / ground / approach transmission in one area and summarizes the session |
 | [radio/bay_all.py](radio/bay_all.py) | Surveys all 43 Bay Area channels to see what you can pick up |
+| [reception_test/](reception_test/README.md) | Reception tests on an RTL-SDR (Mac): scans every channel, ATIS included, stopping only where there is signal; then ADS-B range by direction, with an interactive coverage map (`adsb_viewer.py`) |
 | [radio/record.py](radio/record.py), [pi/record.sh](pi/record.sh) | Records any channel set for a set time, unattended (e.g. on a Raspberry Pi) |
 | [radio/linkwatch.py](radio/linkwatch.py), [pi/linktest.sh](pi/linktest.sh) | Watches the Pi-Pluto link for hours and logs every drop, stall and reconnect |
 | [radio/demo_video.py](radio/demo_video.py) | Demonstration video of a station test: ADS-B tracks on a map, ATC audio on the soundtrack |
@@ -44,6 +45,7 @@ atcsdr/            shared library used by every script
   gr_receiver.py     GNU Radio single-channel receiver (used by listen.py, gui.py, capture_clips.py)
 radio/             airband scripts (listed above)
 adsb/              ADS-B scripts (listed above)
+reception_test/    RTL-SDR reception tests, ATC then ADS-B (see its README)
 pi/                Raspberry Pi: setup.sh (install, checks), characterize.sh, linktest.sh, linkdiag.sh, dspbench.sh, record.sh
 samples/adsb/      a recorded ADS-B session: tracks, maps, animations
 tests/             pytest suite on synthetic signals (no hardware needed)
