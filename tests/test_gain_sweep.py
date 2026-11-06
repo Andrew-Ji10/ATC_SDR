@@ -98,3 +98,49 @@ def test_clips_cut_one_transmission_into_one_clip_per_gain():
     assert any(len(g) >= 2 for tx, g in by_tx.items())    # one voice at several gains
     atis = [r for r in rows if r["kind"] == "atis"]
     assert len({r["tx"] for r in atis}) == 1 and len(atis) <= len(gains)   # one per gain
+
+
+def test_fast_channelizer_matches_the_numpy_one_on_a_tone():
+    pytest.importorskip("numba")
+    rate, (w,), kind = G.plan_sweep(FREQS, 4_800_000)
+    assert kind is G.FastChannelizer
+    chz = G.FastChannelizer(rate, w, threads=1)
+    t = np.arange(1 << 18) / rate
+    x = 0.1 * np.exp(2j * np.pi * (120.5e6 - w.center) * t)
+    raw = np.empty(2 * len(t), np.int16)
+    raw[0::2], raw[1::2] = x.real * 2048, x.imag * 2048
+    frames = chz.feed(raw)
+    assert [k for k, _, _ in frames] == list(range(len(frames)))
+    lv = frames[-1][1]
+    i = [c.name for c in w.channels].index("SFO Twr")
+    assert lv[i] == pytest.approx(-20.0, abs=0.5)
+    assert np.delete(lv, i).max() < lv[i] - 50
+    assert frames[-1][2].shape == (len(w.channels), 400)
+
+
+def test_whole_band_plan_is_the_listening_stations_20_msps():
+    pytest.importorskip("numba")
+    from atcsdr import frequencies as fq
+    from atcsdr import pluto
+    for atis, n in ((False, 43), (True, 51)):
+        rate, windows, kind = G.plan_sweep(fq.area_channels("bay", atis=atis), pluto.PACKED_MAX_RATE)
+        assert (rate, len(windows), kind) == (20_000_000, 1, G.FastChannelizer)
+        assert len(windows[0].channels) == n
+
+
+def test_synthetic_sweep_with_the_fast_receiver(tmp_path):
+    pytest.importorskip("numba")
+    gains = [30, 40, 50, 60, 70]
+    rate, windows, kind = G.plan_sweep(FREQS, 4_800_000)
+    radio = G.SyntheticRadio(windows[0].center, rate, gains[0], realtime=False)
+    saver = _Saver()
+    clips = G.Clips(windows, gains, 8.0, saver, audio_rate=kind.audio_rate)
+    sweep = G.Sweep(radio, rate, windows, gains, slot_s=2.0, clips=clips, channelizer=kind, threads=1)
+    assert sweep.stride == 1 and sweep.clips is clips
+    sweep.run(deadline=radio.clock() + 50)
+    rows, cells, (gain, _) = G.analyze(sweep.data(), sweep.slots, gains, 8.0, 40)
+    by = {r["gain"]: r for r in rows}
+    assert by[50]["snr_vs_ref"] == pytest.approx(model_snr(50) - model_snr(40), abs=1.5)
+    assert gain == 50
+    for r, audio in saver.rows:
+        assert len(audio) == pytest.approx(r["seconds"] * kind.audio_rate, rel=0.01)

@@ -13,8 +13,9 @@ Pluto, antenna and spot?
 Running each gain for its own few minutes would mostly measure who happened to
 be talking. So this switches the gain every --slot seconds (2 s), in a fresh
 random order each round, all through the run: every gain hears the same
-traffic, and one transmission (or an ATIS, which never stops) is usually heard
-at several gains.
+traffic, and one transmission is usually heard at several gains. The channels
+are the listening station's: tower, ground, clearance, approach and departure
+voice (--atis adds the ATIS broadcasts, which never stop: a steady reference).
 
 For every transmission it measures the signal-to-noise ratio at each gain it
 was heard at, against that gain's own noise floor, and fits
@@ -41,8 +42,11 @@ each gain change, named so the clips of one transmission sort together
 gain, to compare by ear. Short slots give the best numbers; long ones
 (--slot 60 --duration 40m) give whole transmissions at one gain, to listen
 to, with every gain still coming round each cycle. Clips need every frame
-demodulated: a computer too slow for that at the whole band (a Pi at 21.6
-MSPS) measures without clips; --area sfo or a lower --max-rate brings them back.
+demodulated. With numba installed (pi/setup.sh installs it) and a link that
+carries the whole band (packed:...), it uses the listening station's compiled
+receiver (atcsdr.fastrx) at 20 MSPS, which a Pi runs with room to spare;
+without numba the numpy filter bank is too slow for the whole band on a Pi,
+and it then measures without clips (--area sfo brings them back).
 
 Writes, to recordings/gain_sweep_<time>/ (or --out): report.txt, per_gain.csv,
 cells.csv (each transmission's SNR at each gain), slots.csv (every slot: gain,
@@ -89,6 +93,8 @@ MIN_CELL_FRAMES = 8          # frames of a transmission at one gain needed to me
 WEAK_DB = 15.0               # weak transmissions: under this SNR at the reference gain
 NEAR_DB = 1.0                # "as good as the best": within this many dB
 MIN_EVENTS = 5               # paired transmissions needed to trust the SNR fit
+ADC_SAMPLE = 7                # ADC stats from every 7th I/Q value (odd: I and Q alike)
+FAST_WARN = 0.8              # fastrx reads on its own threads: warn only near real time
 CPU_BUDGET = 0.3             # analyse at most this fraction of real time (the rest: reading)
 TTY = sys.stdout.isatty()
 CLEAR = "\r\033[K" if TTY else ""
@@ -107,7 +113,12 @@ class Channelizer:
     its AM audio, demodulated as the receiver does it: the envelope normalized
     by its carrier, so a strong and a weak station play equally loud and only
     the noise behind them differs. A frame is `n` samples; the next one starts
-    `hop` samples later."""
+    `hop` samples later. Plain numpy: fine on a Mac, too slow for the whole band
+    on a Pi (FastChannelizer is for that). With stride N, feed() analyses only
+    every Nth frame."""
+
+    audio_rate = A.AUDIO_RATE
+    name = "numpy filter bank"
 
     def __init__(self, rate, window):
         self.bank = A.FilterBank(rate, [c.mhz * 1e6 - window.center for c in window.channels])
@@ -115,11 +126,26 @@ class Channelizer:
         self.frame_s = A.FRAME_S
         self.q = (A.OUT_BLOCK - A.KEEP) // 2
         self.a = 1 - math.exp(-1 / (0.05 * A.AUDIO_RATE))       # 50 ms carrier average
-        self.zi = None
         self.offset_db = 20 * math.log10(self.bank.decim)      # the bank's output is decim x the input
+        self.stride = 1
+        self.reset()
 
     def reset(self):
         self.zi = None
+        self.carry = np.zeros(0, np.int16)
+        self.k = 0
+
+    def feed(self, raw, audio=True):
+        """A chunk of int16 I/Q -> [(frame number since reset(), dB per channel,
+        audio or None)] for each frame it completes (every stride-th)."""
+        self.carry = np.concatenate([self.carry, raw])
+        out = []
+        while len(self.carry) >= 2 * self.n:
+            if self.k % self.stride == 0:
+                out.append((self.k, *self.process(self.carry[: 2 * self.n], audio)))
+            self.carry = self.carry[2 * self.hop:]
+            self.k += 1
+        return out
 
     def process(self, raw, audio=True):
         """raw: one frame (2 * n int16, interleaved I/Q) -> (dB per channel,
@@ -136,17 +162,100 @@ class Channelizer:
         return level, ((env - carrier) / np.maximum(carrier, 1e-6)).astype(np.float32)
 
 
-def choose_stride(chz, audio=True, budget=CPU_BUDGET):
+class FastChannelizer:
+    """The listening station's own receiver (atcsdr.fastrx: a polyphase
+    channelizer and AM demodulator compiled with numba, over `threads` cores):
+    the whole band in one window, every channel at 25 kHz, in the same 16 ms
+    frames, with the same carrier-normalized audio. What lets a Pi keep up with
+    the whole band at 20 MSPS, clips included."""
+
+    audio_rate = 25_000
+    stride = 1
+    name = "fastrx (compiled)"
+
+    def __init__(self, rate, window, threads=2):
+        from atcsdr import fastrx
+        self.F = fastrx
+        self.chan = fastrx.Channelizer(rate, window.center, window.channels, threads)
+        self.n = len(window.channels)
+        self.frame_s = fastrx.FRAME_S
+        self.a = np.float32(1 - math.exp(-1 / (0.05 * fastrx.AUDIO_RATE)))
+        self.reset()
+
+    def reset(self):
+        self.chan.reset()
+        self.state = np.zeros(self.n, np.float32)
+        self.pend_audio = np.zeros((self.n, 0), np.float32)
+        self.pend_env2 = np.zeros((self.n, 0), np.float32)
+        self.k = 0
+
+    def feed(self, raw, audio=True):
+        F = self.F
+        y = self.chan.process(raw)
+        if y.shape[1]:
+            au = np.empty(y.shape, np.float32)
+            env2 = np.empty(y.shape, np.float32)
+            F._am(y, self.state, self.a, au, env2)
+            self.pend_audio = np.concatenate([self.pend_audio, au], axis=1)
+            self.pend_env2 = np.concatenate([self.pend_env2, env2], axis=1)
+        frames = self.pend_audio.shape[1] // F.FRAME
+        out = []
+        if frames:
+            m = frames * F.FRAME
+            db = 10 * np.log10(self.pend_env2[:, :m].reshape(self.n, frames, F.FRAME).mean(axis=2) + 1e-20)
+            for j in range(frames):
+                out.append((self.k, db[:, j].astype(np.float32),
+                            self.pend_audio[:, j * F.FRAME:(j + 1) * F.FRAME] if audio else None))
+                self.k += 1
+            self.pend_audio, self.pend_env2 = self.pend_audio[:, m:], self.pend_env2[:, m:]
+        return out
+
+
+def have_numba():
+    try:
+        import numba  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def plan_sweep(freqs, limit, threads=2, fast=None):
+    """(rate, windows, channelizer class): the whole band in one window with
+    fastrx at the listening station's 20 MSPS when the link carries it and numba
+    is installed; otherwise atcsdr.airband's plan, with fastrx if that's one
+    window, or the numpy filter bank."""
+    from atcsdr import fastrx
+    fast = have_numba() if fast is None else fast
+    if fast:
+        for rate in (20_000_000, 21_600_000):
+            if rate <= limit:
+                try:
+                    center, _ = fastrx.plan_center(freqs, rate)
+                    return rate, [A.Window(center, list(freqs))], FastChannelizer
+                except ValueError:
+                    pass
+    rate, windows = A.plan(freqs, limit)
+    if fast and len(windows) == 1 and rate % fastrx.SPACING == 0:
+        try:
+            center, _ = fastrx.plan_center(freqs, rate)
+            return rate, [A.Window(center, list(freqs))], FastChannelizer
+        except ValueError:
+            pass
+    return rate, windows, Channelizer
+
+
+def choose_stride(chz, rate, audio=True, budget=CPU_BUDGET):
     """Analyse every Nth frame, so that analysis takes at most `budget` of real
-    time and reading the radio never falls behind. Clips need every frame (1)."""
-    raw = (np.random.default_rng(0).standard_normal(2 * chz.n) * 30).astype(np.int16)
-    chz.process(raw, audio)                            # warm up the FFT plan
-    t, k = time.perf_counter(), 6
-    for _ in range(k):
-        chz.process(raw, audio)
+    time and reading the radio never falls behind. Clips need every frame (1).
+    Returns (stride, analysis time as a fraction of real time at stride 1)."""
+    raw = (np.random.default_rng(0).standard_normal(2 * (1 << 18)) * 30).astype(np.int16)
+    chz.feed(raw, audio)                               # warm up (and compile)
+    t, n = time.perf_counter(), 0
+    for _ in range(3):
+        n += len(chz.feed(raw, audio))
+    load = (time.perf_counter() - t) / (3 * len(raw) / 2 / rate)
     chz.reset()
-    per_frame = (time.perf_counter() - t) / k
-    return max(1, math.ceil(per_frame / (chz.frame_s * budget)))
+    return max(1, math.ceil(load / budget)), load
 
 
 # ------------------------------------------------------------------ clips
@@ -168,8 +277,9 @@ class Clips:
     TX_GAP_S = 2.5                         # clips this close (across a gain change): one transmission
     ATIS_CLIP_S = 15.0
 
-    def __init__(self, windows, gains, threshold, saver, atis_per_gain=1):
+    def __init__(self, windows, gains, threshold, saver, atis_per_gain=1, audio_rate=A.AUDIO_RATE):
         self.windows, self.gains, self.threshold, self.saver = windows, gains, threshold, saver
+        self.audio_rate = audio_rate
         self.atis_per_gain = atis_per_gain
         self.hist = {}
         self.floor = {}
@@ -259,7 +369,8 @@ class Clips:
         self.saved += 1
         self.saver.put(dict(tx=tx, window=wi + 1, mhz=ch.mhz, name=ch.name, kind=ch.kind,
                             gain=self.gains[gi], start=seg["start"], seconds=seconds,
-                            snr_db=snr_db(mean_db, floor), cut=int(cut)), np.concatenate(chunks))
+                            snr_db=snr_db(mean_db, floor), cut=int(cut), rate=self.audio_rate),
+                       np.concatenate(chunks))
 
 
 class ClipSaver(threading.Thread):
@@ -285,7 +396,9 @@ class ClipSaver(threading.Thread):
             stem = (f"tx{row['tx']:04d}_{row['name'].replace(' ', '_')}_{row['mhz']:.3f}_{when:%H%M%S}"
                     f"_g{row['gain']:g}")
             title = f"{row['name']} {row['mhz']:.3f} MHz, gain {row['gain']:g} dB, {when:%H:%M:%S}"
-            path = audiofile.save_mp3(resample_poly(audio, 1, 3), str(self.folder / f"{stem}.mp3"), 16_000,
+            g = math.gcd(16_000, row["rate"])
+            path = audiofile.save_mp3(resample_poly(audio, 16_000 // g, row["rate"] // g),
+                                      str(self.folder / f"{stem}.mp3"), 16_000,
                                       self.lame, title, f"gain sweep, transmission {row['tx']}")
             row = dict(row, file=Path(path).name, time=f"{when:%Y-%m-%d %H:%M:%S}")
             self.rows.append(row)
@@ -389,12 +502,19 @@ class Sweep:
     """Rotates the gain every slot, through every capture window, and keeps
     every analysed frame's level for each channel."""
 
-    def __init__(self, radio, rate, windows, gains, slot_s, seed=0, stride=None, clips=None):
+    def __init__(self, radio, rate, windows, gains, slot_s, seed=0, stride=None, clips=None,
+                 channelizer=None, threads=2):
         self.radio, self.rate, self.windows, self.gains = radio, rate, windows, list(gains)
         self.slot_s = slot_s
         self.clock = getattr(radio, "clock", time.time)
-        self.meters = [Channelizer(rate, w) for w in windows]
-        self.stride = stride or choose_stride(self.meters[0], audio=clips is not None)
+        kind = channelizer or Channelizer
+        self.meters = [kind(rate, w, threads) if kind is FastChannelizer else kind(rate, w) for w in windows]
+        self.load = None
+        if stride is None:
+            stride, self.load = choose_stride(self.meters[0], rate, audio=clips is not None)
+        self.stride = 1 if kind is FastChannelizer else stride
+        for m in self.meters:
+            m.stride = self.stride
         self.clips = clips if self.stride == 1 else None       # clips need every frame
         self.rng = np.random.default_rng(seed)
         self.frames = [dict(level=[], t=[], gain=[], slot=[]) for _ in windows]
@@ -440,30 +560,25 @@ class Sweep:
         if clips:
             clips.start_slot(wi, gi)
         t0 = self.clock()
-        carry = np.zeros(0, np.int16)
-        k = clipped = total = 0
+        clipped = total = frames = 0
         power = 0.0
-        need, step = 2 * chz.n, 2 * chz.hop
         try:
             while self.clock() - t0 < self.slot_s and not (deadline and self.clock() >= deadline):
-                carry = np.concatenate([carry, self.read()])
-                while len(carry) >= need:
-                    frame, carry = carry[:need], carry[step:]
-                    if k % self.stride == 0:
-                        level, audio = chz.process(frame, audio=clips is not None)
-                        t = t0 + k * chz.frame_s
-                        fr["level"].append(level)
-                        fr["t"].append(t)
-                        fr["gain"].append(gi)
-                        fr["slot"].append(s)
-                        if clips:
-                            clips.frame(t, level, audio)
-                        new = frame[:step]                     # each sample counted once
-                        clipped += int(np.count_nonzero(np.abs(new) >= CLIP_LEVEL))
-                        total += len(new)
-                        f32 = new.astype(np.float32)
-                        power += float(f32 @ f32)
-                    k += 1
+                raw = self.read()
+                for k, level, audio in chz.feed(raw, audio=clips is not None):
+                    t = t0 + k * chz.frame_s
+                    fr["level"].append(level)
+                    fr["t"].append(t)
+                    fr["gain"].append(gi)
+                    fr["slot"].append(s)
+                    frames += 1
+                    if clips:
+                        clips.frame(t, level, audio)
+                sample = raw[::ADC_SAMPLE]                 # ADC level and clipping from a sample
+                clipped += int(np.count_nonzero(np.abs(sample) >= CLIP_LEVEL))
+                total += len(sample)
+                f32 = sample.astype(np.float32)
+                power += float(f32 @ f32)
                 if status:
                     status(self, wi, gi)
         finally:
@@ -471,7 +586,7 @@ class Sweep:
                 clips.end_slot()
         rms = math.sqrt(power / max(total, 1)) / 2048
         self.slots.append(dict(window=wi, gain=self.gains[gi], t=t0, seconds=self.clock() - t0,
-                               frames=total // step, adc_rms_dbfs=20 * math.log10(rms + 1e-12),
+                               frames=frames, adc_rms_dbfs=20 * math.log10(rms + 1e-12),
                                clipped=clipped / max(total, 1)))
 
     def data(self):
@@ -895,7 +1010,9 @@ def main():
     p.add_argument("--device", default="", help="the radio, e.g. packed:192.168.3.2 or ip:192.168.3.2 "
                                                 "(default: a Pluto on USB)")
     p.add_argument("--source", choices=["radio", "synthetic"], default="radio", help="default radio")
-    p.add_argument("--area", choices=names, default="bay", help="channel set, ATIS included (default bay)")
+    p.add_argument("--area", choices=names, default="bay",
+                   help="channel set (default bay: the listening station's 43 voice channels)")
+    p.add_argument("--atis", action="store_true", help="also the ATIS channels (a steady reference signal)")
     p.add_argument("--gains", type=float, nargs="+", default=[30, 35, 40, 45, 50, 55, 60, 65],
                    help="gains to compare, dB (default 30 35 ... 65)")
     p.add_argument("--ref-gain", type=float, default=40.0,
@@ -908,6 +1025,8 @@ def main():
                    help="dB above the noise floor that counts as a signal, as the squelch (default 8)")
     p.add_argument("--no-clips", action="store_true", help="don't save audio clips")
     p.add_argument("--atis-clips", type=int, default=1, help="clips of each ATIS per gain (default 1)")
+    p.add_argument("--threads", type=int, default=2, help="cores for the compiled receiver (default 2)")
+    p.add_argument("--numpy", action="store_true", help="use the numpy filter bank even if numba is installed")
     p.add_argument("--seed", type=int, default=0, help="seed for the gain order")
     p.add_argument("--out", help="output folder (default recordings/gain_sweep_<time>)")
     p.add_argument("--reanalyze", metavar="DIR", help="rerun the analysis on a saved run's levels.npz")
@@ -928,11 +1047,12 @@ def main():
     gains = sorted(set(args.gains))
     if len(gains) < 2:
         sys.exit("Give at least two gains to compare.")
-    freqs = fq.area_channels(args.area, atis=True) if args.area in fq.AREAS else fq.preset_channels(args.area, True)
+    freqs = (fq.area_channels(args.area, atis=args.atis) if args.area in fq.AREAS
+             else fq.preset_channels(args.area, args.atis))
     uri = A.find_uri(args.device) if args.source == "radio" else "synthetic"
     limit = (A.max_rate(uri, args.max_rate) if args.source == "radio"
              else int((args.max_rate or pluto.USB_MAX_RATE / 1e6) * 1e6))
-    rate, windows = A.plan(freqs, limit)
+    rate, windows, kind = plan_sweep(freqs, limit, args.threads, fast=False if args.numpy else None)
     out = Path(args.out or ROOT / f"recordings/gain_sweep_{datetime.now():%Y%m%d-%H%M}")
     out.mkdir(parents=True, exist_ok=True)
 
@@ -947,21 +1067,30 @@ def main():
         radio = SyntheticRadio(windows[0].center, rate, gains[0])
 
     saver = None if args.no_clips else ClipSaver(out / "clips", out / "clips.csv")
-    clips = saver and Clips(windows, gains, args.threshold, saver, args.atis_clips)
-    sweep = Sweep(radio, rate, windows, gains, args.slot, seed=args.seed, clips=clips)
+    clips = saver and Clips(windows, gains, args.threshold, saver, args.atis_clips, kind.audio_rate)
+    sweep = Sweep(radio, rate, windows, gains, args.slot, seed=args.seed, clips=clips, channelizer=kind,
+                  threads=args.threads)
     m = sweep.meters[0]
+    if kind is FastChannelizer and sweep.load and sweep.load > FAST_WARN:
+        print(f"Note: the receiver needs {100 * sweep.load:.0f}% of real time on {args.threads} core(s) here, "
+              f"close to falling behind: try --threads {args.threads + 1}, or stop other programs.")
+    elif sweep.stride > 1:
+        print(f"Note: the receiver needs {100 * sweep.load:.0f}% of real time here: every "
+              f"{sweep.stride}th frame is analysed.")
     if saver and sweep.clips is None:
-        print(f"Clips off: this computer can't demodulate every frame at {rate / 1e6:g} MSPS. For clips, "
-              "use fewer channels (--area sfo) or a lower --max-rate.")
+        hint = ("pip install numba (pi/setup.sh does) for the compiled receiver"
+                if kind is Channelizer and not have_numba() else "use fewer channels (--area sfo)")
+        print(f"Clips off: this computer can't demodulate every frame at {rate / 1e6:g} MSPS with the "
+              f"{kind.name}. For clips, {hint}.")
         saver = None
     if saver:
         saver.start()
     started = datetime.now()
-    header = [f"Gain sweep, {started:%Y-%m-%d %H:%M}: {args.area} ({len(freqs)} channels with ATIS), "
+    header = [f"Gain sweep, {started:%Y-%m-%d %H:%M}: {args.area} ({len(freqs)} channels{' with ATIS' if args.atis else ''}), "
               f"radio {uri} ({A.link_name(uri) if args.source == 'radio' else 'synthetic'}), "
-              f"{rate / 1e6:g} MSPS, {len(windows)} window(s)",
+              f"{rate / 1e6:g} MSPS, {len(windows)} window(s), receiver: {kind.name}",
               f"Gains {', '.join(format(g, 'g') for g in gains)} dB, {args.slot:g} s each in a random order per round"
-              + (f", per window" if len(windows) > 1 else "")
+              + (", per window" if len(windows) > 1 else "")
               + f"; analysing every {'' if sweep.stride == 1 else str(sweep.stride) + 'th '}frame "
                 f"({1000 * m.frame_s:.0f} ms); threshold {args.threshold:g} dB."]
     print("\n".join(header))
