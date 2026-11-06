@@ -25,6 +25,7 @@ Tools for listening to, recording and decoding Bay Area air traffic with an ADAL
 | [radio/dsp_bench.py](radio/dsp_bench.py), [pi/dspbench.sh](pi/dspbench.sh) | Benchmarks the DSP for the whole band in one window (21.6 MSPS), single- and multi-core |
 | [radio/characterize.py](radio/characterize.py), [pi/characterize.sh](pi/characterize.sh) | Measures CPU, link and RF (gain sweep, interference), and recommends `--max-rate` / `--gain` |
 | [radio/multi_atc.py](radio/multi_atc.py) | Plays any set of channels live, in stereo |
+| [radio/gain_sweep.py](radio/gain_sweep.py), [pi/gain_sweep.sh](pi/gain_sweep.sh) | Compares RF gains on live traffic (10 min, switching every 2 s): SNR of the same transmissions at each gain, clipping, spurs, and a clip of each transmission at each gain to compare by ear; recommends `--gain` |
 | [radio/listen.py](radio/listen.py), [gui.py](radio/gui.py), [atc_receiver.grc](radio/atc_receiver.grc) | One channel at a time (FM or AM), on the command line, in a GUI, or in GNU Radio Companion |
 | [radio/capture_clips.py](radio/capture_clips.py) | Saves transmissions on one channel as clips |
 | [radio/clean_audio.py](radio/clean_audio.py) | Reduces the static in recorded clips |
